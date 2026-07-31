@@ -1,9 +1,9 @@
 [package]
-name = "SarcasticallyUnsafeProgrammingLanguageSUPL"
+name = "QuickMathematicalCalculationsLanguage"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "SUPL - the Sarcastically Unsafe Programming Language"
+description = "QMCL - the Quick Mathematical Calculations Language"
 
 [dependencies]
 inkwell = { version = "0.9", features = ["llvm22-1"] }
