@@ -119,16 +119,19 @@ impl Parser {
         }
     }
 
-    /// expr := comparison — the entry point every caller uses.
-    fn parse_expr(&mut self) -> Result<Expr, QmclError> {
-        self.parse_comparison()
+    /// expr := comparison — the entry point every caller uses. `prefer_integer`
+    /// controls whether a bare literal at the leaves (parse_atom) becomes an
+    /// IntegerLiteral or a NumberLiteral — true only when parsing an
+    /// `integer`-typed declare's value.
+    fn parse_expr(&mut self, prefer_integer: bool) -> Result<Expr, QmclError> {
+        self.parse_comparison(prefer_integer)
     }
 
     /// comparison := additive (('>' | '<') additive)?  — loosest precedence,
     /// and deliberately NOT chainable (a > b > c isn't supported) to avoid
     /// picking chained-comparison semantics nobody's asked for yet.
-    fn parse_comparison(&mut self) -> Result<Expr, QmclError> {
-        let left = self.parse_additive()?;
+    fn parse_comparison(&mut self, prefer_integer: bool) -> Result<Expr, QmclError> {
+        let left = self.parse_additive(prefer_integer)?;
         let op_span = self.peek_span();
         let op = match self.peek() {
             Token::Greater => BinOp::Gt,
@@ -136,13 +139,13 @@ impl Parser {
             _ => return Ok(left),
         };
         self.advance();
-        let right = self.parse_additive()?;
+        let right = self.parse_additive(prefer_integer)?;
         Ok(Expr::BinaryOp(op, Box::new(left), Box::new(right), op_span))
     }
 
     /// additive := multiplicative (('+' | '-') multiplicative)*  — left-associative.
-    fn parse_additive(&mut self) -> Result<Expr, QmclError> {
-        let mut left = self.parse_multiplicative()?;
+    fn parse_additive(&mut self, prefer_integer: bool) -> Result<Expr, QmclError> {
+        let mut left = self.parse_multiplicative(prefer_integer)?;
         loop {
             let op_span = self.peek_span();
             let op = match self.peek() {
@@ -151,15 +154,15 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            let right = self.parse_multiplicative()?;
+            let right = self.parse_multiplicative(prefer_integer)?;
             left = Expr::BinaryOp(op, Box::new(left), Box::new(right), op_span);
         }
         Ok(left)
     }
 
     /// multiplicative := power (('*' | '/') power)*  — binds tighter than +/-.
-    fn parse_multiplicative(&mut self) -> Result<Expr, QmclError> {
-        let mut left = self.parse_power()?;
+    fn parse_multiplicative(&mut self, prefer_integer: bool) -> Result<Expr, QmclError> {
+        let mut left = self.parse_power(prefer_integer)?;
         loop {
             let op_span = self.peek_span();
             let op = match self.peek() {
@@ -168,7 +171,7 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            let right = self.parse_power()?;
+            let right = self.parse_power(prefer_integer)?;
             left = Expr::BinaryOp(op, Box::new(left), Box::new(right), op_span);
         }
         Ok(left)
@@ -177,22 +180,33 @@ impl Parser {
     /// power := atom (('^' | '**') power)?  — right-associative (recurses
     /// back into itself, not atom, on the right so 2^3^2 = 2^(3^2)), and
     /// binds tighter than */÷.
-    fn parse_power(&mut self) -> Result<Expr, QmclError> {
-        let base = self.parse_atom()?;
+    fn parse_power(&mut self, prefer_integer: bool) -> Result<Expr, QmclError> {
+        let base = self.parse_atom(prefer_integer)?;
         let op_span = self.peek_span();
         if *self.peek() == Token::Caret {
             self.advance();
-            let exp = self.parse_power()?;
+            let exp = self.parse_power(prefer_integer)?;
             Ok(Expr::BinaryOp(BinOp::Pow, Box::new(base), Box::new(exp), op_span))
         } else {
             Ok(base)
         }
     }
 
-    /// atom := a quoted number literal, or a (variable) reference.
-    fn parse_atom(&mut self) -> Result<Expr, QmclError> {
+    /// atom := a quoted number/integer literal, or a (variable) reference.
+    fn parse_atom(&mut self, prefer_integer: bool) -> Result<Expr, QmclError> {
         let tok = self.advance();
         match tok.node {
+            Token::Quoted(s) if prefer_integer => {
+                let grouped = s.contains(',');
+                let n: i64 = strip_thousands_separators(&s).parse().map_err(|_| {
+                    QmclError::new(format!("'{}' is not a valid integer literal", s))
+                        .at(tok.span)
+                        .rule("a quoted integer literal must be a whole number, no decimal point")
+                        .suggest("use digits with no decimal point, e.g. '1000'")
+                        .suggest("thousands separators are allowed too, e.g. '1,000,000'")
+                })?;
+                Ok(Expr::IntegerLiteral(n, grouped))
+            }
             Token::Quoted(s) => {
                 let grouped = s.contains(',');
                 let n: f64 = strip_thousands_separators(&s).parse().map_err(|_| {
@@ -278,6 +292,22 @@ impl Parser {
             Token::TypeName(t) if t == "string" => Type::String,
             Token::TypeName(t) if t == "boolean" => Type::Boolean,
             Token::TypeName(t) if t == "percentage" => Type::Percentage,
+            Token::TypeName(t) if t == "integer" => Type::Integer(64),
+            Token::TypeName(t) if t.starts_with("integer:") => {
+                let width_str = &t["integer:".len()..];
+                match width_str.parse::<u8>() {
+                    Ok(w @ (8 | 16 | 32 | 64)) => Type::Integer(w),
+                    _ => {
+                        return Err(QmclError::new(format!(
+                            "unsupported integer precision ':{}'",
+                            width_str
+                        ))
+                        .at(ty_tok.span)
+                        .rule("integer's precision suffix must be 8, 16, 32, or 64")
+                        .suggest("use integer:8, integer:16, integer:32, integer:64, or plain integer (defaults to 64)"))
+                    }
+                }
+            }
             other => {
                 return Err(QmclError::new(format!(
                     "expected a type name, found {}",
@@ -285,15 +315,17 @@ impl Parser {
                 ))
                 .at(ty_tok.span)
                 .rule("a type name must follow the '=' in a declaration")
-                .suggest("use 'number' (optionally number:16/32/64), 'string', 'boolean', or 'percentage'"))
+                .suggest("use 'number', 'integer' (optionally with :8/16/32/64), 'string', 'boolean', or 'percentage'"))
             }
         };
 
-        // number is the only type with full expression support (arithmetic,
-        // variable references) right now — string/boolean/percentage take a
-        // single literal value each, parsed according to their own rules.
+        // number/integer are the only types with full expression support
+        // (arithmetic, variable references) right now — string/boolean/
+        // percentage take a single literal value each, parsed according to
+        // their own rules.
         let value = match ty {
-            Type::Number(_) => self.parse_expr()?,
+            Type::Number(_) => self.parse_expr(false)?,
+            Type::Integer(_) => self.parse_expr(true)?,
             Type::String => {
                 let tok = self.advance();
                 match tok.node {
@@ -377,7 +409,11 @@ impl Parser {
                     parts.push(PrintPart::Text(s));
                 }
                 Token::LParen | Token::Quoted(_) => {
-                    let expr = self.parse_expr()?;
+                    // print[...] never declares a type, so a bare literal
+                    // stays a NumberLiteral here — an Integer only ever
+                    // enters via a (variable) reference to something
+                    // already declared as one.
+                    let expr = self.parse_expr(false)?;
                     parts.push(PrintPart::Value(expr));
                 }
                 Token::Eof => {

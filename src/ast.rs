@@ -10,6 +10,10 @@ pub enum Type {
     /// re-appends '%' for display. Always 64-bit — precision selection isn't
     /// extended to percentage in this pass.
     Percentage,
+    /// Bit width: 8, 16, 32, or 64 (default 64, e.g. `integer:16` vs plain
+    /// `integer`). A genuinely separate representation from Number — real
+    /// integer arithmetic, not a float that looks whole.
+    Integer(u8),
 }
 
 use crate::error::Span;
@@ -35,6 +39,8 @@ pub enum Expr {
     /// The bool is whether the original literal used thousands separators
     /// (e.g. '1,000,000') — carried through so printing can reproduce them.
     NumberLiteral(f64, bool),
+    /// Same grouped-flag idea as NumberLiteral, but for a genuine integer.
+    IntegerLiteral(i64, bool),
     StringLiteral(String),
     BooleanLiteral(bool),
     /// A variable reference (the `x` in `(x)`), carrying where it was

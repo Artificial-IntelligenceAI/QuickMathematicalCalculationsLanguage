@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
-use inkwell::types::FloatType;
+use inkwell::types::{FloatType, IntType};
 use inkwell::values::{BasicMetadataValueEnum, FloatValue, FunctionValue, IntValue, PointerValue};
-use inkwell::{AddressSpace, FloatPredicate};
+use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 
 use crate::ast::*;
 use crate::error::{QmclError, QmclInfo, Span};
@@ -30,8 +30,20 @@ enum Value<'ctx> {
     /// 100% is stored as 1.0), kept as its own variant purely so printing
     /// knows to re-scale by 100 and append '%'. Always 64-bit.
     Percentage(FloatValue<'ctx>, bool),
+    /// A genuine integer — separate representation from Number, real
+    /// integer arithmetic rather than a float that looks whole. bool/u8
+    /// mean the same thing as on Number (grouped-for-print, current width).
+    Integer(IntValue<'ctx>, bool, u8),
     Boolean(IntValue<'ctx>),
     Str(PointerValue<'ctx>),
+}
+
+/// A value classified as either a true integer or a float-family number
+/// (Number/Percentage), for arithmetic — Boolean/Str never reach this,
+/// they're rejected before classification.
+enum Numeric<'ctx> {
+    Int(IntValue<'ctx>, bool, u8),
+    Float(FloatValue<'ctx>, bool, u8),
 }
 
 pub struct Codegen<'ctx> {
@@ -91,6 +103,106 @@ impl<'ctx> Codegen<'ctx> {
         } else {
             self.builder.build_float_trunc(f, target_ty, "narrow").unwrap()
         }
+    }
+
+    fn int_type_for_width(&self, width: u8) -> IntType<'ctx> {
+        match width {
+            8 => self.context.i8_type(),
+            16 => self.context.i16_type(),
+            32 => self.context.i32_type(),
+            _ => self.context.i64_type(),
+        }
+    }
+
+    /// Widens or narrows `i` from `from_width` to `to_width` (sign-extend
+    /// or truncate), or returns it unchanged if they're already equal.
+    fn cast_int_to_width(&mut self, i: IntValue<'ctx>, from_width: u8, to_width: u8) -> IntValue<'ctx> {
+        if from_width == to_width {
+            return i;
+        }
+        let target_ty = self.int_type_for_width(to_width);
+        if to_width > from_width {
+            self.builder.build_int_s_extend(i, target_ty, "iwiden").unwrap()
+        } else {
+            self.builder.build_int_truncate(i, target_ty, "inarrow").unwrap()
+        }
+    }
+
+    fn int_to_f64(&mut self, i: IntValue<'ctx>) -> FloatValue<'ctx> {
+        self.builder
+            .build_signed_int_to_float(i, self.context.f64_type(), "itof")
+            .unwrap()
+    }
+
+    /// Classifies a Value for arithmetic, rejecting Boolean/Str with a clear
+    /// error (rather than emitting broken IR) — those aren't usable in
+    /// arithmetic yet.
+    fn classify_numeric(&mut self, v: Value<'ctx>, span: Span) -> Numeric<'ctx> {
+        match v {
+            Value::Number(f, grouped, width) => Numeric::Float(f, grouped, width),
+            Value::Percentage(f, grouped) => Numeric::Float(f, grouped, 64),
+            Value::Integer(i, grouped, width) => Numeric::Int(i, grouped, width),
+            Value::Boolean(_) => {
+                self.errors.push(
+                    QmclError::new("a boolean value can't be used in arithmetic")
+                        .at(span)
+                        .rule("arithmetic operators only work on number/integer/percentage values")
+                        .suggest("only use +, -, *, /, ^ with number, integer, or percentage values"),
+                );
+                Numeric::Float(self.context.f64_type().const_float(0.0), false, 64)
+            }
+            Value::Str(_) => {
+                self.errors.push(
+                    QmclError::new("a string value can't be used in arithmetic")
+                        .at(span)
+                        .rule("arithmetic operators only work on number/integer/percentage values")
+                        .suggest("only use +, -, *, /, ^ with number, integer, or percentage values"),
+                );
+                Numeric::Float(self.context.f64_type().const_float(0.0), false, 64)
+            }
+        }
+    }
+
+    /// Converts a Numeric to a float for the mixed/float arithmetic path.
+    /// Converting a genuine Int here means an integer got mixed with a
+    /// number/percentage — surfaced via the Informer rather than done
+    /// silently, since the result is no longer a true integer.
+    fn numeric_to_float(&mut self, n: Numeric<'ctx>, op_span: Span) -> (FloatValue<'ctx>, bool, u8) {
+        match n {
+            Numeric::Float(f, grouped, width) => (f, grouped, width),
+            Numeric::Int(i, grouped, _width) => {
+                self.notes.push(
+                    QmclInfo::new(
+                        "mixed integer and number here — automatically computed as a number (float)",
+                    )
+                    .at(op_span),
+                );
+                (self.int_to_f64(i), grouped, 64)
+            }
+        }
+    }
+
+    /// Same idea as `numeric_to_float`, but silent — used when a `number`/
+    /// `percentage` declare's value happens to resolve to an integer (e.g.
+    /// `declare 'y' = number (some_int_var).`), which is plain assignment
+    /// rather than an arithmetic operation mixing types, so it's treated
+    /// the same as any other widening declare-time conversion (silent).
+    fn coerce_to_float(&mut self, v: Value<'ctx>, span: Span) -> (FloatValue<'ctx>, bool, u8) {
+        match self.classify_numeric(v, span) {
+            Numeric::Float(f, grouped, width) => (f, grouped, width),
+            Numeric::Int(i, grouped, _width) => (self.int_to_f64(i), grouped, 64),
+        }
+    }
+
+    /// Registers `name` with a zero placeholder after a declare-time type
+    /// error, so later references to it report as the (already-reported)
+    /// wrong-type error instead of cascading into a separate "undeclared
+    /// variable" error.
+    fn declare_placeholder_integer(&mut self, name: &str, width: u8, ty: Type) {
+        let int_ty = self.int_type_for_width(width);
+        let ptr = self.builder.build_alloca(int_ty, name).unwrap();
+        self.builder.build_store(ptr, int_ty.const_int(0, false)).unwrap();
+        self.vars.insert(name.to_string(), (ptr, ty, false));
     }
 
     /// QMCL programs have no `fn main`-equivalent — top-level statements just
@@ -166,7 +278,7 @@ impl<'ctx> Codegen<'ctx> {
                 let val = self.compile_expr(value);
                 match ty {
                     Type::Number(width) => {
-                        let (f, grouped, val_width) = self.as_number(val, *name_span);
+                        let (f, grouped, val_width) = self.coerce_to_float(val, *name_span);
                         let f = self.cast_to_width(f, val_width, *width);
                         let float_ty = self.float_type_for_width(*width);
                         let ptr = self.builder.build_alloca(float_ty, name).unwrap();
@@ -174,13 +286,40 @@ impl<'ctx> Codegen<'ctx> {
                         self.vars.insert(name.clone(), (ptr, *ty, grouped));
                     }
                     Type::Percentage => {
-                        let (f, grouped, val_width) = self.as_number(val, *name_span);
+                        let (f, grouped, val_width) = self.coerce_to_float(val, *name_span);
                         let f = self.cast_to_width(f, val_width, 64);
                         let f64_ty = self.context.f64_type();
                         let ptr = self.builder.build_alloca(f64_ty, name).unwrap();
                         self.builder.build_store(ptr, f).unwrap();
                         self.vars.insert(name.clone(), (ptr, *ty, grouped));
                     }
+                    Type::Integer(width) => match val {
+                        Value::Integer(i, grouped, val_width) => {
+                            let i = self.cast_int_to_width(i, val_width, *width);
+                            let int_ty = self.int_type_for_width(*width);
+                            let ptr = self.builder.build_alloca(int_ty, name).unwrap();
+                            self.builder.build_store(ptr, i).unwrap();
+                            self.vars.insert(name.clone(), (ptr, *ty, grouped));
+                        }
+                        Value::Number(..) | Value::Percentage(..) => {
+                            self.errors.push(
+                                QmclError::new("cannot store a number (float) value in an integer variable")
+                                    .at(*name_span)
+                                    .rule("an integer variable's value must stay a true integer — mixing in a number/percentage anywhere in the expression makes the whole result a float")
+                                    .suggest("make sure every part of this expression is an integer, or declare this variable as 'number' instead"),
+                            );
+                            self.declare_placeholder_integer(name, *width, *ty);
+                        }
+                        Value::Boolean(_) | Value::Str(_) => {
+                            self.errors.push(
+                                QmclError::new("cannot store a boolean/string value in an integer variable")
+                                    .at(*name_span)
+                                    .rule("an integer's value must be an integer expression")
+                                    .suggest("declare this as 'boolean'/'string' instead, or fix the expression"),
+                            );
+                            self.declare_placeholder_integer(name, *width, *ty);
+                        }
+                    },
                     Type::Boolean => {
                         // Guaranteed to already be a Value::Boolean — the
                         // parser only ever produces a BooleanLiteral here.
@@ -245,6 +384,22 @@ impl<'ctx> Codegen<'ctx> {
                             fmt.push_str(if grouped { "%'.15g%%" } else { "%.15g%%" }); // %% is a literal '%' to printf
                             args.push(scaled.into());
                         }
+                        Value::Integer(i, grouped, width) => {
+                            // C's variadic default-argument promotion widens
+                            // anything narrower than `int` (32-bit) to int
+                            // automatically — replicated by hand here since
+                            // we're emitting the call directly rather than
+                            // going through a C compiler that'd do it for
+                            // us. 64-bit needs %lld specifically.
+                            if width == 64 {
+                                fmt.push_str(if grouped { "%'lld" } else { "%lld" });
+                                args.push(i.into());
+                            } else {
+                                let i32_val = self.cast_int_to_width(i, width, 32);
+                                fmt.push_str(if grouped { "%'d" } else { "%d" });
+                                args.push(i32_val.into());
+                            }
+                        }
                         Value::Boolean(b) => {
                             let true_str = self
                                 .builder
@@ -292,6 +447,12 @@ impl<'ctx> Codegen<'ctx> {
             Expr::NumberLiteral(n, grouped) => {
                 Value::Number(self.context.f64_type().const_float(*n), *grouped, 64)
             }
+            // Same idea — no inherent declared width until it's stored
+            // somewhere or combined with another integer; evaluated at
+            // 64-bit and narrowed at the point of use.
+            Expr::IntegerLiteral(n, grouped) => {
+                Value::Integer(self.context.i64_type().const_int(*n as u64, true), *grouped, 64)
+            }
             Expr::StringLiteral(s) => {
                 let ptr = self
                     .builder
@@ -324,6 +485,15 @@ impl<'ctx> Codegen<'ctx> {
                                 .unwrap()
                                 .into_float_value();
                             Value::Percentage(v, grouped)
+                        }
+                        Type::Integer(width) => {
+                            let int_ty = self.int_type_for_width(*width);
+                            let v = self
+                                .builder
+                                .build_load(int_ty, ptr, name)
+                                .unwrap()
+                                .into_int_value();
+                            Value::Integer(v, grouped, *width)
                         }
                         Type::Boolean => {
                             let v = self
@@ -359,125 +529,201 @@ impl<'ctx> Codegen<'ctx> {
             Expr::BinaryOp(op, left, right, op_span) => {
                 let l_val = self.compile_expr(left);
                 let r_val = self.compile_expr(right);
-                let (l, l_grouped, l_width) = self.as_number(l_val, *op_span);
-                let (r, r_grouped, r_width) = self.as_number(r_val, *op_span);
-                // If either side wants thousands separators, the result
-                // does too.
-                let grouped = l_grouped || r_grouped;
-                // Mixed precision auto-promotes to the wider side, but
-                // that's surfaced via the Informer rather than done
-                // silently.
-                let target_width = l_width.max(r_width);
-                if l_width != r_width {
-                    self.notes.push(
-                        QmclInfo::new(format!(
-                            "mixed precision here ({}-bit and {}-bit) — automatically computed at {}-bit",
-                            l_width, r_width, target_width
-                        ))
-                        .at(*op_span),
-                    );
-                }
-                let l = self.cast_to_width(l, l_width, target_width);
-                let r = self.cast_to_width(r, r_width, target_width);
-                match op {
-                    BinOp::Add => Value::Number(
-                        self.builder.build_float_add(l, r, "addtmp").unwrap(),
-                        grouped,
-                        target_width,
-                    ),
-                    BinOp::Sub => Value::Number(
-                        self.builder.build_float_sub(l, r, "subtmp").unwrap(),
-                        grouped,
-                        target_width,
-                    ),
-                    BinOp::Mul => Value::Number(
-                        self.builder.build_float_mul(l, r, "multmp").unwrap(),
-                        grouped,
-                        target_width,
-                    ),
-                    BinOp::Div => Value::Number(
-                        self.builder.build_float_div(l, r, "divtmp").unwrap(),
-                        grouped,
-                        target_width,
-                    ),
-                    BinOp::Pow => {
-                        // libm's pow is always (double, double) -> double,
-                        // regardless of the operands' actual width.
-                        let l64 = self.cast_to_width(l, target_width, 64);
-                        let r64 = self.cast_to_width(r, target_width, 64);
-                        let pow_fn = self.pow_fn.expect("pow_fn set at start of compile_program");
-                        let result = match self
-                            .builder
-                            .build_call(pow_fn, &[l64.into(), r64.into()], "powtmp")
-                            .unwrap()
-                            .try_as_basic_value()
-                        {
-                            inkwell::values::ValueKind::Basic(v) => v.into_float_value(),
-                            inkwell::values::ValueKind::Instruction(_) => {
-                                unreachable!("pow always returns a value, never void")
+                let l_num = self.classify_numeric(l_val, *op_span);
+                let r_num = self.classify_numeric(r_val, *op_span);
+
+                match (l_num, r_num) {
+                    // Both genuine integers — stays true integer math.
+                    (Numeric::Int(l, l_grouped, l_width), Numeric::Int(r, r_grouped, r_width)) => {
+                        self.compile_integer_binop(op, l, l_grouped, l_width, r, r_grouped, r_width, *op_span)
+                    }
+                    // At least one side is a number/percentage (or an
+                    // integer that needs promoting to sit alongside one) —
+                    // the existing float path, unchanged from before
+                    // Integer existed.
+                    (l_num, r_num) => {
+                        let (l, l_grouped, l_width) = self.numeric_to_float(l_num, *op_span);
+                        let (r, r_grouped, r_width) = self.numeric_to_float(r_num, *op_span);
+                        // If either side wants thousands separators, the
+                        // result does too.
+                        let grouped = l_grouped || r_grouped;
+                        // Mixed precision auto-promotes to the wider side,
+                        // but that's surfaced via the Informer rather than
+                        // done silently.
+                        let target_width = l_width.max(r_width);
+                        if l_width != r_width {
+                            self.notes.push(
+                                QmclInfo::new(format!(
+                                    "mixed precision here ({}-bit and {}-bit) — automatically computed at {}-bit",
+                                    l_width, r_width, target_width
+                                ))
+                                .at(*op_span),
+                            );
+                        }
+                        let l = self.cast_to_width(l, l_width, target_width);
+                        let r = self.cast_to_width(r, r_width, target_width);
+                        match op {
+                            BinOp::Add => Value::Number(
+                                self.builder.build_float_add(l, r, "addtmp").unwrap(),
+                                grouped,
+                                target_width,
+                            ),
+                            BinOp::Sub => Value::Number(
+                                self.builder.build_float_sub(l, r, "subtmp").unwrap(),
+                                grouped,
+                                target_width,
+                            ),
+                            BinOp::Mul => Value::Number(
+                                self.builder.build_float_mul(l, r, "multmp").unwrap(),
+                                grouped,
+                                target_width,
+                            ),
+                            BinOp::Div => Value::Number(
+                                self.builder.build_float_div(l, r, "divtmp").unwrap(),
+                                grouped,
+                                target_width,
+                            ),
+                            BinOp::Pow => {
+                                // libm's pow is always (double, double) ->
+                                // double, regardless of the operands' actual
+                                // width.
+                                let l64 = self.cast_to_width(l, target_width, 64);
+                                let r64 = self.cast_to_width(r, target_width, 64);
+                                let pow_fn = self.pow_fn.expect("pow_fn set at start of compile_program");
+                                let result = match self
+                                    .builder
+                                    .build_call(pow_fn, &[l64.into(), r64.into()], "powtmp")
+                                    .unwrap()
+                                    .try_as_basic_value()
+                                {
+                                    inkwell::values::ValueKind::Basic(v) => v.into_float_value(),
+                                    inkwell::values::ValueKind::Instruction(_) => {
+                                        unreachable!("pow always returns a value, never void")
+                                    }
+                                };
+                                let result = self.cast_to_width(result, 64, target_width);
+                                Value::Number(result, grouped, target_width)
                             }
-                        };
-                        let result = self.cast_to_width(result, 64, target_width);
-                        Value::Number(result, grouped, target_width)
-                    }
-                    // No boolean type is produced here (comparisons predate
-                    // Boolean and still yield a plain number) — 1.0 or 0.0.
-                    BinOp::Gt => {
-                        let cmp = self
-                            .builder
-                            .build_float_compare(FloatPredicate::OGT, l, r, "gttmp")
-                            .unwrap();
-                        Value::Number(
-                            self.builder
-                                .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
-                                .unwrap(),
-                            false,
-                            64,
-                        )
-                    }
-                    BinOp::Lt => {
-                        let cmp = self
-                            .builder
-                            .build_float_compare(FloatPredicate::OLT, l, r, "lttmp")
-                            .unwrap();
-                        Value::Number(
-                            self.builder
-                                .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
-                                .unwrap(),
-                            false,
-                            64,
-                        )
+                            // No boolean type is produced here (comparisons
+                            // predate Boolean and still yield a plain
+                            // number) — 1.0 or 0.0.
+                            BinOp::Gt => {
+                                let cmp = self
+                                    .builder
+                                    .build_float_compare(FloatPredicate::OGT, l, r, "gttmp")
+                                    .unwrap();
+                                Value::Number(
+                                    self.builder
+                                        .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
+                                        .unwrap(),
+                                    false,
+                                    64,
+                                )
+                            }
+                            BinOp::Lt => {
+                                let cmp = self
+                                    .builder
+                                    .build_float_compare(FloatPredicate::OLT, l, r, "lttmp")
+                                    .unwrap();
+                                Value::Number(
+                                    self.builder
+                                        .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
+                                        .unwrap(),
+                                    false,
+                                    64,
+                                )
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Coerces a `Value` into a float (plus its "should print grouped" flag
-    /// and its current bit width) for arithmetic, reporting a clear error
-    /// (rather than emitting broken IR) if it's actually a string or
-    /// boolean — those aren't usable in arithmetic yet.
-    fn as_number(&mut self, v: Value<'ctx>, span: Span) -> (FloatValue<'ctx>, bool, u8) {
-        match v {
-            Value::Number(f, grouped, width) => (f, grouped, width),
-            Value::Percentage(f, grouped) => (f, grouped, 64),
-            Value::Boolean(_) => {
-                self.errors.push(
-                    QmclError::new("a boolean value can't be used in arithmetic")
-                        .at(span)
-                        .rule("arithmetic operators only work on number/percentage values")
-                        .suggest("only use +, -, *, /, ^ with number or percentage values"),
+    /// Real integer arithmetic for when both operands of a BinaryOp are
+    /// genuine integers. Mismatched integer widths auto-promote to the
+    /// wider one (Informer note, same as floats). `/` truncates (C/Rust
+    /// convention) with a static Informer note at every integer-division
+    /// site, regardless of the actual runtime values. `^` still goes
+    /// through libm's pow (fixed double signature), so it's the one
+    /// operator that produces a Number (float) result even when both
+    /// inputs were integers — a real, flagged asymmetry with +/-/*//.
+    #[allow(clippy::too_many_arguments)]
+    fn compile_integer_binop(
+        &mut self,
+        op: &BinOp,
+        l: IntValue<'ctx>,
+        l_grouped: bool,
+        l_width: u8,
+        r: IntValue<'ctx>,
+        r_grouped: bool,
+        r_width: u8,
+        op_span: Span,
+    ) -> Value<'ctx> {
+        let grouped = l_grouped || r_grouped;
+        let target_width = l_width.max(r_width);
+        if l_width != r_width {
+            self.notes.push(
+                QmclInfo::new(format!(
+                    "mixed precision here ({}-bit and {}-bit integers) — automatically computed at {}-bit",
+                    l_width, r_width, target_width
+                ))
+                .at(op_span),
+            );
+        }
+        let l = self.cast_int_to_width(l, l_width, target_width);
+        let r = self.cast_int_to_width(r, r_width, target_width);
+        match op {
+            BinOp::Add => Value::Integer(self.builder.build_int_add(l, r, "iaddtmp").unwrap(), grouped, target_width),
+            BinOp::Sub => Value::Integer(self.builder.build_int_sub(l, r, "isubtmp").unwrap(), grouped, target_width),
+            BinOp::Mul => Value::Integer(self.builder.build_int_mul(l, r, "imultmp").unwrap(), grouped, target_width),
+            BinOp::Div => {
+                self.notes.push(
+                    QmclInfo::new("integer division here truncates any remainder (e.g. 7 / 2 = 3, not 3.5)")
+                        .at(op_span),
                 );
-                (self.context.f64_type().const_float(0.0), false, 64)
+                Value::Integer(
+                    self.builder.build_int_signed_div(l, r, "idivtmp").unwrap(),
+                    grouped,
+                    target_width,
+                )
             }
-            Value::Str(_) => {
-                self.errors.push(
-                    QmclError::new("a string value can't be used in arithmetic")
-                        .at(span)
-                        .rule("arithmetic operators only work on number/percentage values")
-                        .suggest("only use +, -, *, /, ^ with number or percentage values"),
-                );
-                (self.context.f64_type().const_float(0.0), false, 64)
+            BinOp::Pow => {
+                let lf = self.int_to_f64(l);
+                let rf = self.int_to_f64(r);
+                let pow_fn = self.pow_fn.expect("pow_fn set at start of compile_program");
+                let result = match self
+                    .builder
+                    .build_call(pow_fn, &[lf.into(), rf.into()], "ipowtmp")
+                    .unwrap()
+                    .try_as_basic_value()
+                {
+                    inkwell::values::ValueKind::Basic(v) => v.into_float_value(),
+                    inkwell::values::ValueKind::Instruction(_) => {
+                        unreachable!("pow always returns a value, never void")
+                    }
+                };
+                Value::Number(result, grouped, 64)
+            }
+            BinOp::Gt => {
+                let cmp = self.builder.build_int_compare(IntPredicate::SGT, l, r, "igttmp").unwrap();
+                Value::Number(
+                    self.builder
+                        .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
+                        .unwrap(),
+                    false,
+                    64,
+                )
+            }
+            BinOp::Lt => {
+                let cmp = self.builder.build_int_compare(IntPredicate::SLT, l, r, "ilttmp").unwrap();
+                Value::Number(
+                    self.builder
+                        .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
+                        .unwrap(),
+                    false,
+                    64,
+                )
             }
         }
     }

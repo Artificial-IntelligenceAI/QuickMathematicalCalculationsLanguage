@@ -110,7 +110,7 @@ const KEYWORDS: &[(&str, fn() -> Token)] = &[
     ("print", || Token::Print),
 ];
 
-const TYPE_NAMES: &[&str] = &["number", "string", "boolean", "percentage"];
+const TYPE_NAMES: &[&str] = &["number", "string", "boolean", "percentage", "integer"];
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
@@ -306,14 +306,16 @@ impl<'a> Lexer<'a> {
         if TYPE_NAMES.contains(&text.as_str()) {
             return Ok(Token::TypeName(text));
         }
-        // number:16 / number:32 / number:64 — a precision suffix on the
-        // number type. ':' and digits aren't reserved characters, so this
-        // already scans as a single identifier-like token above; the
-        // parser is what actually validates/parses the width and rejects
-        // anything else that happens to contain a colon.
-        if let Some(width) = text.strip_prefix("number:") {
-            if !width.is_empty() && width.chars().all(|c| c.is_ascii_digit()) {
-                return Ok(Token::TypeName(text));
+        // number:16 / number:32 / number:64 and integer:8/16/32/64 — a
+        // precision suffix on those types. ':' and digits aren't reserved
+        // characters, so this already scans as a single identifier-like
+        // token above; the parser is what actually validates/parses the
+        // width and rejects anything else that happens to contain a colon.
+        for prefix in ["number:", "integer:"] {
+            if let Some(width) = text.strip_prefix(prefix) {
+                if !width.is_empty() && width.chars().all(|c| c.is_ascii_digit()) {
+                    return Ok(Token::TypeName(text));
+                }
             }
         }
         Ok(Token::Ident(text))
