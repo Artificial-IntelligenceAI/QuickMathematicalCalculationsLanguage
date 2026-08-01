@@ -32,6 +32,9 @@ impl<T> Spanned<T> {
 pub struct QmclError {
     pub message: String,
     pub span: Option<Span>,
+    /// The general grammar rule that was broken.
+    pub rule: Option<String>,
+    /// Concrete, actionable fix(es) for this specific occurrence.
     pub suggestions: Vec<String>,
 }
 
@@ -40,12 +43,18 @@ impl QmclError {
         QmclError {
             message: message.into(),
             span: None,
+            rule: None,
             suggestions: Vec::new(),
         }
     }
 
     pub fn at(mut self, span: Span) -> Self {
         self.span = Some(span);
+        self
+    }
+
+    pub fn rule(mut self, rule: impl Into<String>) -> Self {
+        self.rule = Some(rule.into());
         self
     }
 
@@ -81,6 +90,9 @@ impl QmclError {
             };
 
             out.push_str(&format!("  --> {}:{}:{}\n", filename, line_no, col_no));
+            out.push_str(&format!("  file:   {}\n", filename));
+            out.push_str(&format!("  line:   {}\n", line_no));
+            out.push_str(&format!("  column: {}\n", col_no));
             if let Some(line_text) = line_text {
                 let gutter = line_no.to_string();
                 let pad = " ".repeat(gutter.len());
@@ -91,11 +103,15 @@ impl QmclError {
             }
         }
 
+        if let Some(rule) = &self.rule {
+            out.push_str(&format!("rule: {}\n", rule));
+        }
+
         for (i, suggestion) in self.suggestions.iter().enumerate() {
             if i == 0 {
-                out.push_str(&format!("help: {}\n", suggestion));
+                out.push_str(&format!("suggestion(s): {}\n", suggestion));
             } else {
-                out.push_str(&format!("      {}\n", suggestion));
+                out.push_str(&format!("               {}\n", suggestion));
             }
         }
 

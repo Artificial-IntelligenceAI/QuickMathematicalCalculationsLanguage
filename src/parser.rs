@@ -73,7 +73,8 @@ impl Parser {
                 describe(other)
             ))
             .at(self.error_span())
-            .suggest("statements start with 'declare' or 'print'")),
+            .rule("every statement must start with 'declare' or 'print'")
+            .suggest("start this statement with 'declare' or 'print'")),
         }
     }
 
@@ -89,12 +90,15 @@ impl Parser {
                     describe(&other)
                 ))
                 .at(name_tok.span)
+                .rule("the name being declared must be written in quotes right after 'declare'")
                 .suggest("write the name in quotes, e.g. declare 'x' = number '1000'."))
             }
         };
 
-        self.expect(&Token::Equals)
-            .map_err(|e| e.suggest("declarations look like: declare 'x' = number '1000'."))?;
+        self.expect(&Token::Equals).map_err(|e| {
+            e.rule("'declare' is followed by '=' between the name and its type")
+                .suggest("add an '=' here, e.g. declare 'x' = number '1000'.")
+        })?;
 
         let ty_tok = self.advance();
         let ty = match ty_tok.node {
@@ -105,7 +109,8 @@ impl Parser {
                     describe(&other)
                 ))
                 .at(ty_tok.span)
-                .suggest("currently only 'number' is a supported type"))
+                .rule("a type name must follow the '=' in a declaration")
+                .suggest("use 'number' — it's currently the only supported type"))
             }
         };
 
@@ -115,7 +120,8 @@ impl Parser {
                 let n: i64 = s.parse().map_err(|_| {
                     QmclError::new(format!("'{}' is not a valid number literal", s))
                         .at(value_tok.span)
-                        .suggest("numbers must be plain digits, e.g. '1000'")
+                        .rule("a quoted number literal must contain only digits")
+                        .suggest("use plain digits, e.g. '1000'")
                 })?;
                 Expr::NumberLiteral(n)
             }
@@ -125,12 +131,15 @@ impl Parser {
                     describe(&other)
                 ))
                 .at(value_tok.span)
+                .rule("a declared value must be written in quotes, right after its type")
                 .suggest("write the value in quotes, e.g. number '1000'"))
             }
         };
 
-        self.expect(&Token::Period)
-            .map_err(|e| e.suggest("statements end with a '.', e.g. declare 'x' = number '1000'."))?;
+        self.expect(&Token::Period).map_err(|e| {
+            e.rule("every statement must end with a '.'")
+                .suggest("add a '.' at the end, e.g. declare 'x' = number '1000'.")
+        })?;
 
         Ok(Stmt::Declare { name, ty, value })
     }
@@ -138,8 +147,10 @@ impl Parser {
     fn parse_print(&mut self) -> Result<Stmt, QmclError> {
         self.advance(); // `print`
 
-        self.expect(&Token::LBracket)
-            .map_err(|e| e.suggest("print's arguments go inside [ ], e.g. print[\"hi\"]."))?;
+        self.expect(&Token::LBracket).map_err(|e| {
+            e.rule("'print' is always followed by its arguments inside [ ]")
+                .suggest("add [ ] after 'print', e.g. print[\"hi\"].")
+        })?;
 
         let mut parts = Vec::new();
         loop {
@@ -160,10 +171,14 @@ impl Parser {
                                 describe(&other)
                             ))
                             .at(ident_tok.span)
+                            .rule("inside ( ), only a bare (unquoted) variable name is allowed")
                             .suggest("reference a variable like (x), with no quotes around it"))
                         }
                     };
-                    self.expect(&Token::RParen)?;
+                    self.expect(&Token::RParen).map_err(|e| {
+                        e.rule("a '(' opened to reference a variable must be closed with ')'")
+                            .suggest("add a ')' right after the variable name")
+                    })?;
                     parts.push(PrintPart::Value(Expr::Var(name, span)));
                 }
                 other => {
@@ -172,14 +187,20 @@ impl Parser {
                         describe(&other)
                     ))
                     .at(self.error_span())
-                    .suggest("print[...] only accepts \"text\" and (variable) references"))
+                    .rule("print[...] only accepts \"text\" and (variable) references")
+                    .suggest("wrap text in \"...\" or reference a variable with (...)"))
                 }
             }
         }
 
-        self.expect(&Token::RBracket)?;
-        self.expect(&Token::Period)
-            .map_err(|e| e.suggest("statements end with a '.'"))?;
+        self.expect(&Token::RBracket).map_err(|e| {
+            e.rule("print's arguments must be closed with a matching ']'")
+                .suggest("add a ']' to close the print[...] call")
+        })?;
+        self.expect(&Token::Period).map_err(|e| {
+            e.rule("every statement must end with a '.'")
+                .suggest("add a '.' at the end")
+        })?;
 
         Ok(Stmt::Print { parts })
     }

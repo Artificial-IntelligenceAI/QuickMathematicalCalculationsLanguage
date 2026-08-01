@@ -103,6 +103,7 @@ impl<'ctx> Codegen<'ctx> {
                 let ptr = *self.vars.get(name).ok_or_else(|| {
                     QmclError::new(format!("undeclared variable '{}'", name))
                         .at(*span)
+                        .rule("a variable must be declared before it's referenced")
                         .suggest(format!(
                             "declare it first, e.g. declare '{}' = number '...'.",
                             name

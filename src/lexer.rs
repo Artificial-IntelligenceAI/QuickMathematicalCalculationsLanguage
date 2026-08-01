@@ -173,7 +173,8 @@ impl<'a> Lexer<'a> {
                 Some("\\") => {
                     return Err(QmclError::new("unexpected '\\' outside a quoted literal")
                         .at(start)
-                        .suggest("escape sequences like \\' and \\\" are only meaningful inside quotes"));
+                        .rule("a '\\' is only meaningful inside a quoted '...'/\"...\" span, where it starts an escape sequence")
+                        .suggest("remove the '\\', or move it inside a quoted span"));
                 }
                 Some(g) => {
                     if is_ascii_digit(g) {
@@ -182,6 +183,7 @@ impl<'a> Lexer<'a> {
                             g
                         ))
                         .at(start)
+                        .rule("numeric literals must always be written inside quotes")
                         .suggest(format!("wrap the number in quotes, e.g. '{}000'", g)));
                     }
                     tokens.push(Spanned::new(self.read_ident()?, start));
@@ -202,13 +204,15 @@ impl<'a> Lexer<'a> {
                 None => {
                     return Err(QmclError::new("unterminated quoted literal")
                         .at(start)
+                        .rule("a quoted name/literal must be closed with a matching quote before the line/file ends")
                         .suggest(format!("add a closing {} to end it", quote)))
                 }
                 Some("\\") => match self.advance() {
                     None => {
                         return Err(QmclError::new("unterminated escape sequence")
                             .at(start)
-                            .suggest("a '\\' must be followed by one of: \\' \\\" \\\\ \\n \\t"))
+                            .rule("a '\\' inside quotes must be followed by a valid escape character")
+                            .suggest("use one of: \\' \\\" \\\\ \\n \\t"))
                     }
                     Some(esc) => {
                         raw.push('\\');
