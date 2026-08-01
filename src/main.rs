@@ -43,6 +43,9 @@ fn print_notes(notes: &[QmclInfo], path: &str, source: &str) {
 enum Task {
     Compile,
     Run,
+    /// Same as Run, but the binary is deleted right after it finishes —
+    /// nothing left behind on disk.
+    TempRun,
 }
 
 struct Args {
@@ -51,7 +54,7 @@ struct Args {
     output: Option<String>,
 }
 
-const USAGE: &str = "usage:\n  qmcl task:compile file:<path>.qmcl [outputfilename:<name>]\n  qmcl task:run file:<path>.qmcl [outputfilename:<name>]";
+const USAGE: &str = "usage:\n  qmcl task:compile file:<path>.qmcl [outputfilename:<name>]\n  qmcl task:run file:<path>.qmcl [outputfilename:<name>]\n  qmcl task:temprun file:<path>.qmcl [outputfilename:<name>]";
 
 /// Parses `key:value` arguments (e.g. `task:compile`, `file:hello.qmcl`).
 /// Splits on the *known key name plus its colon* as a fixed prefix, not on
@@ -89,8 +92,14 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
     let task = match task.as_deref() {
         Some("compile") => Task::Compile,
         Some("run") => Task::Run,
-        Some(other) => return Err(format!("unknown task '{}' — expected 'compile' or 'run'", other)),
-        None => return Err("missing 'task:compile' or 'task:run'".to_string()),
+        Some("temprun") => Task::TempRun,
+        Some(other) => {
+            return Err(format!(
+                "unknown task '{}' — expected 'compile', 'run', or 'temprun'",
+                other
+            ))
+        }
+        None => return Err("missing 'task:compile', 'task:run', or 'task:temprun'".to_string()),
     };
     let file = file.ok_or_else(|| "missing 'file:<path>.qmcl'".to_string())?;
 
@@ -213,13 +222,18 @@ fn main() {
         }
     }
 
-    if let Task::Run = args.task {
+    if let Task::Run | Task::TempRun = args.task {
         let run_status = Command::new(runnable_path(&output_path))
             .status()
             .unwrap_or_else(|e| {
                 eprintln!("qmcl: couldn't run '{}': {}", output_path, e);
                 exit(1);
             });
+
+        if let Task::TempRun = args.task {
+            let _ = fs::remove_file(&output_path);
+        }
+
         exit(run_status.code().unwrap_or(1));
     }
 }
