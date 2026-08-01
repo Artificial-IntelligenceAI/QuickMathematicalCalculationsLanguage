@@ -3,10 +3,15 @@ pub enum Type {
     Number,
 }
 
+use crate::error::Span;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     NumberLiteral(i64),
-    Var(String),
+    /// A variable reference (the `x` in `(x)`), carrying where it was
+    /// written so codegen can point at it if the variable turns out to be
+    /// undeclared.
+    Var(String, Span),
 }
 
 #[derive(Debug, Clone, PartialEq)]

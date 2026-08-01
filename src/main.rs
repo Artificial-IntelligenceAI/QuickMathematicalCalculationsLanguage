@@ -1,5 +1,6 @@
 mod ast;
 mod codegen;
+mod error;
 mod lexer;
 mod parser;
 
@@ -10,6 +11,13 @@ use std::process::exit;
 use inkwell::context::Context;
 use inkwell::execution_engine::JitFunction;
 use inkwell::OptimizationLevel;
+
+use error::QmclError;
+
+fn fail(err: QmclError, path: &str, source: &str) -> ! {
+    eprint!("{}", err.render(path, source));
+    exit(1);
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -23,21 +31,19 @@ fn main() {
         exit(1);
     });
 
-    let tokens = lexer::Lexer::new(&source).tokenize().unwrap_or_else(|e| {
-        eprintln!("qmcl: lex error: {}", e);
-        exit(1);
-    });
+    let tokens = lexer::Lexer::new(&source)
+        .tokenize()
+        .unwrap_or_else(|e| fail(e, path, &source));
 
     let program = parser::Parser::new(tokens)
         .parse_program()
-        .unwrap_or_else(|e| {
-            eprintln!("qmcl: parse error: {}", e);
-            exit(1);
-        });
+        .unwrap_or_else(|e| fail(e, path, &source));
 
     let context = Context::create();
     let mut codegen = codegen::Codegen::new(&context, "qmcl_module");
-    codegen.compile_program(&program);
+    if let Err(e) = codegen.compile_program(&program) {
+        fail(e, path, &source);
+    }
 
     let execution_engine = codegen
         .module()

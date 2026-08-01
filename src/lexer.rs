@@ -1,5 +1,7 @@
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::error::{QmclError, Span, Spanned};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Declare,
@@ -22,6 +24,25 @@ pub enum Token {
     /// `.` at the top level is unambiguously a terminator, not a decimal point.
     Period,
     Eof,
+}
+
+/// Human-readable description of a token, for error messages.
+pub fn describe(tok: &Token) -> String {
+    match tok {
+        Token::Declare => "'declare'".to_string(),
+        Token::Print => "'print'".to_string(),
+        Token::TypeName(t) => format!("type name '{}'", t),
+        Token::Quoted(s) => format!("'{}'", s),
+        Token::Str(s) => format!("\"{}\"", s),
+        Token::Ident(s) => format!("identifier '{}'", s),
+        Token::LParen => "'('".to_string(),
+        Token::RParen => "')'".to_string(),
+        Token::LBracket => "'['".to_string(),
+        Token::RBracket => "']'".to_string(),
+        Token::Equals => "'='".to_string(),
+        Token::Period => "'.'".to_string(),
+        Token::Eof => "end of file".to_string(),
+    }
 }
 
 /// Characters that can never be part of a bare identifier or emoji name.
@@ -60,6 +81,8 @@ fn decode_escapes(raw: &str) -> String {
 pub struct Lexer<'a> {
     graphemes: Vec<&'a str>,
     pos: usize,
+    line: usize,
+    col: usize,
 }
 
 const KEYWORDS: &[(&str, fn() -> Token)] = &[
@@ -74,7 +97,13 @@ impl<'a> Lexer<'a> {
         Lexer {
             graphemes: src.graphemes(true).collect(),
             pos: 0,
+            line: 1,
+            col: 1,
         }
+    }
+
+    fn current_span(&self) -> Span {
+        Span::new(self.line, self.col)
     }
 
     fn peek(&self) -> Option<&'a str> {
@@ -83,8 +112,14 @@ impl<'a> Lexer<'a> {
 
     fn advance(&mut self) -> Option<&'a str> {
         let g = self.peek();
-        if g.is_some() {
+        if let Some(g) = g {
             self.pos += 1;
+            if g == "\n" {
+                self.line += 1;
+                self.col = 1;
+            } else {
+                self.col += 1;
+            }
         }
         g
     }
@@ -99,52 +134,57 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    pub fn tokenize(mut self) -> Result<Vec<Token>, String> {
+    pub fn tokenize(mut self) -> Result<Vec<Spanned<Token>>, QmclError> {
         let mut tokens = Vec::new();
         loop {
             self.skip_whitespace();
+            let start = self.current_span();
             match self.peek() {
                 None => {
-                    tokens.push(Token::Eof);
+                    tokens.push(Spanned::new(Token::Eof, start));
                     break;
                 }
-                Some("'") => tokens.push(self.read_quoted('\'', true)?),
-                Some("\"") => tokens.push(self.read_quoted('"', false)?),
+                Some("'") => tokens.push(Spanned::new(self.read_quoted('\'', true)?, start)),
+                Some("\"") => tokens.push(Spanned::new(self.read_quoted('"', false)?, start)),
                 Some("(") => {
                     self.advance();
-                    tokens.push(Token::LParen);
+                    tokens.push(Spanned::new(Token::LParen, start));
                 }
                 Some(")") => {
                     self.advance();
-                    tokens.push(Token::RParen);
+                    tokens.push(Spanned::new(Token::RParen, start));
                 }
                 Some("[") => {
                     self.advance();
-                    tokens.push(Token::LBracket);
+                    tokens.push(Spanned::new(Token::LBracket, start));
                 }
                 Some("]") => {
                     self.advance();
-                    tokens.push(Token::RBracket);
+                    tokens.push(Spanned::new(Token::RBracket, start));
                 }
                 Some("=") => {
                     self.advance();
-                    tokens.push(Token::Equals);
+                    tokens.push(Spanned::new(Token::Equals, start));
                 }
                 Some(".") => {
                     self.advance();
-                    tokens.push(Token::Period);
+                    tokens.push(Spanned::new(Token::Period, start));
                 }
                 Some("\\") => {
-                    return Err("unexpected '\\' outside a quoted literal".to_string());
+                    return Err(QmclError::new("unexpected '\\' outside a quoted literal")
+                        .at(start)
+                        .suggest("escape sequences like \\' and \\\" are only meaningful inside quotes"));
                 }
                 Some(g) => {
                     if is_ascii_digit(g) {
-                        return Err(format!(
-                            "bare digits aren't allowed outside a quoted literal (found '{}') — numbers must be written like '1000'",
+                        return Err(QmclError::new(format!(
+                            "bare digit '{}' isn't allowed outside a quoted literal",
                             g
-                        ));
+                        ))
+                        .at(start)
+                        .suggest(format!("wrap the number in quotes, e.g. '{}000'", g)));
                     }
-                    tokens.push(self.read_ident()?);
+                    tokens.push(Spanned::new(self.read_ident()?, start));
                 }
             }
         }
@@ -153,14 +193,23 @@ impl<'a> Lexer<'a> {
 
     /// Scans a `'...'` or `"..."` span (opening delimiter must be at `pos`),
     /// decoding escapes, and returns it as the appropriate token.
-    fn read_quoted(&mut self, quote: char, is_name_or_literal: bool) -> Result<Token, String> {
+    fn read_quoted(&mut self, quote: char, is_name_or_literal: bool) -> Result<Token, QmclError> {
+        let start = self.current_span();
         self.advance(); // consume opening quote
         let mut raw = String::new();
         loop {
             match self.advance() {
-                None => return Err("unterminated quoted literal".to_string()),
+                None => {
+                    return Err(QmclError::new("unterminated quoted literal")
+                        .at(start)
+                        .suggest(format!("add a closing {} to end it", quote)))
+                }
                 Some("\\") => match self.advance() {
-                    None => return Err("unterminated escape sequence".to_string()),
+                    None => {
+                        return Err(QmclError::new("unterminated escape sequence")
+                            .at(start)
+                            .suggest("a '\\' must be followed by one of: \\' \\\" \\\\ \\n \\t"))
+                    }
                     Some(esc) => {
                         raw.push('\\');
                         raw.push_str(esc);
@@ -179,7 +228,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_ident(&mut self) -> Result<Token, String> {
+    fn read_ident(&mut self) -> Result<Token, QmclError> {
+        let start = self.current_span();
         let mut text = String::new();
         while let Some(g) = self.peek() {
             if g.chars().all(char::is_whitespace) || is_reserved(g) {
@@ -189,7 +239,7 @@ impl<'a> Lexer<'a> {
             self.advance();
         }
         if text.is_empty() {
-            return Err("expected an identifier".to_string());
+            return Err(QmclError::new("expected an identifier").at(start));
         }
         for (kw, make) in KEYWORDS {
             if *kw == text {
