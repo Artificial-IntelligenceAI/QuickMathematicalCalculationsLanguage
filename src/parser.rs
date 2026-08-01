@@ -111,9 +111,29 @@ impl Parser {
         }
     }
 
-    /// expr := term (('+' | '-') term)*  — left-associative, lowest precedence.
+    /// expr := comparison — the entry point every caller uses.
     fn parse_expr(&mut self) -> Result<Expr, QmclError> {
-        let mut left = self.parse_term()?;
+        self.parse_comparison()
+    }
+
+    /// comparison := additive (('>' | '<') additive)?  — loosest precedence,
+    /// and deliberately NOT chainable (a > b > c isn't supported) to avoid
+    /// picking chained-comparison semantics nobody's asked for yet.
+    fn parse_comparison(&mut self) -> Result<Expr, QmclError> {
+        let left = self.parse_additive()?;
+        let op = match self.peek() {
+            Token::Greater => BinOp::Gt,
+            Token::Less => BinOp::Lt,
+            _ => return Ok(left),
+        };
+        self.advance();
+        let right = self.parse_additive()?;
+        Ok(Expr::BinaryOp(op, Box::new(left), Box::new(right)))
+    }
+
+    /// additive := multiplicative (('+' | '-') multiplicative)*  — left-associative.
+    fn parse_additive(&mut self) -> Result<Expr, QmclError> {
+        let mut left = self.parse_multiplicative()?;
         loop {
             let op = match self.peek() {
                 Token::Plus => BinOp::Add,
@@ -121,15 +141,15 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            let right = self.parse_term()?;
+            let right = self.parse_multiplicative()?;
             left = Expr::BinaryOp(op, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
-    /// term := atom (('*' | '/') atom)*  — binds tighter than +/-.
-    fn parse_term(&mut self) -> Result<Expr, QmclError> {
-        let mut left = self.parse_atom()?;
+    /// multiplicative := power (('*' | '/') power)*  — binds tighter than +/-.
+    fn parse_multiplicative(&mut self) -> Result<Expr, QmclError> {
+        let mut left = self.parse_power()?;
         loop {
             let op = match self.peek() {
                 Token::Star => BinOp::Mul,
@@ -137,10 +157,24 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            let right = self.parse_atom()?;
+            let right = self.parse_power()?;
             left = Expr::BinaryOp(op, Box::new(left), Box::new(right));
         }
         Ok(left)
+    }
+
+    /// power := atom (('^' | '**') power)?  — right-associative (recurses
+    /// back into itself, not atom, on the right so 2^3^2 = 2^(3^2)), and
+    /// binds tighter than */÷.
+    fn parse_power(&mut self) -> Result<Expr, QmclError> {
+        let base = self.parse_atom()?;
+        if *self.peek() == Token::Caret {
+            self.advance();
+            let exp = self.parse_power()?;
+            Ok(Expr::BinaryOp(BinOp::Pow, Box::new(base), Box::new(exp)))
+        } else {
+            Ok(base)
+        }
     }
 
     /// atom := a quoted number literal, or a (variable) reference.

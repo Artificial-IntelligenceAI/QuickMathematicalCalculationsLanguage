@@ -24,6 +24,10 @@ pub enum Token {
     Star,
     /// `/` or `÷` — both produce this same token, `÷` is just an alias.
     Slash,
+    /// `^` or `**` — both produce this same token, `**` is just an alias.
+    Caret,
+    Greater,
+    Less,
     /// Statement terminator `.`. Only ever produced outside a quoted span —
     /// numeric literals are always written quoted (e.g. `'1000'`), so a bare
     /// `.` at the top level is unambiguously a terminator, not a decimal point.
@@ -49,6 +53,9 @@ pub fn describe(tok: &Token) -> String {
         Token::Minus => "'-'".to_string(),
         Token::Star => "'*'".to_string(),
         Token::Slash => "'/'".to_string(),
+        Token::Caret => "'^' (or '**')".to_string(),
+        Token::Greater => "'>'".to_string(),
+        Token::Less => "'<'".to_string(),
         Token::Period => "'.'".to_string(),
         Token::Eof => "end of file".to_string(),
     }
@@ -58,7 +65,8 @@ pub fn describe(tok: &Token) -> String {
 fn is_reserved(g: &str) -> bool {
     matches!(
         g,
-        "'" | "\"" | "(" | ")" | "[" | "]" | "=" | "." | "\\" | "+" | "-" | "*" | "/" | "÷"
+        "'" | "\"" | "(" | ")" | "[" | "]" | "=" | "." | "\\" | "+" | "-" | "*" | "/" | "÷" | "^"
+            | ">" | "<"
     )
 }
 
@@ -188,11 +196,28 @@ impl<'a> Lexer<'a> {
                 }
                 Some("*") => {
                     self.advance();
-                    tokens.push(Spanned::new(Token::Star, start));
+                    if self.peek() == Some("*") {
+                        self.advance();
+                        tokens.push(Spanned::new(Token::Caret, start));
+                    } else {
+                        tokens.push(Spanned::new(Token::Star, start));
+                    }
                 }
                 Some("/") | Some("÷") => {
                     self.advance();
                     tokens.push(Spanned::new(Token::Slash, start));
+                }
+                Some("^") => {
+                    self.advance();
+                    tokens.push(Spanned::new(Token::Caret, start));
+                }
+                Some(">") => {
+                    self.advance();
+                    tokens.push(Spanned::new(Token::Greater, start));
+                }
+                Some("<") => {
+                    self.advance();
+                    tokens.push(Spanned::new(Token::Less, start));
                 }
                 Some(".") => {
                     self.advance();

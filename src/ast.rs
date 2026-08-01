@@ -11,6 +11,12 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// Right-associative: 2^3^2 = 2^(3^2), not (2^3)^2.
+    Pow,
+    /// No boolean type yet, so comparisons produce a number: 1.0 (true) or
+    /// 0.0 (false) — same simplification C used before it had a real bool.
+    Gt,
+    Lt,
 }
 
 #[derive(Debug, Clone, PartialEq)]

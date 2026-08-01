@@ -4,7 +4,7 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::values::{BasicMetadataValueEnum, FloatValue, FunctionValue, PointerValue};
-use inkwell::AddressSpace;
+use inkwell::{AddressSpace, FloatPredicate};
 
 use crate::ast::*;
 use crate::error::{QmclError, QmclInfo};
@@ -20,6 +20,9 @@ pub struct Codegen<'ctx> {
     /// Notable-but-not-wrong things worth telling the programmer about,
     /// e.g. a variable being shadowed. Never blocks compilation.
     notes: Vec<QmclInfo>,
+    /// libm's `pow` — LLVM has no native float-exponentiation instruction,
+    /// so `^`/`**` compiles to a call to this, same as C/C++ do.
+    pow_fn: Option<FunctionValue<'ctx>>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -31,6 +34,7 @@ impl<'ctx> Codegen<'ctx> {
             vars: HashMap::new(),
             errors: Vec::new(),
             notes: Vec::new(),
+            pow_fn: None,
         }
     }
 
@@ -53,6 +57,10 @@ impl<'ctx> Codegen<'ctx> {
         let i32_ty = self.context.i32_type();
         let printf_ty = i32_ty.fn_type(&[i8_ptr_ty.into()], true);
         let printf_fn = self.module.add_function("printf", printf_ty, None);
+
+        let f64_ty = self.context.f64_type();
+        let pow_ty = f64_ty.fn_type(&[f64_ty.into(), f64_ty.into()], false);
+        self.pow_fn = Some(self.module.add_function("pow", pow_ty, None));
 
         let main_ty = i32_ty.fn_type(&[], false);
         let main_fn = self.module.add_function("main", main_ty, None);
@@ -157,6 +165,40 @@ impl<'ctx> Codegen<'ctx> {
                     BinOp::Sub => self.builder.build_float_sub(l, r, "subtmp").unwrap(),
                     BinOp::Mul => self.builder.build_float_mul(l, r, "multmp").unwrap(),
                     BinOp::Div => self.builder.build_float_div(l, r, "divtmp").unwrap(),
+                    BinOp::Pow => {
+                        let pow_fn = self.pow_fn.expect("pow_fn set at start of compile_program");
+                        match self
+                            .builder
+                            .build_call(pow_fn, &[l.into(), r.into()], "powtmp")
+                            .unwrap()
+                            .try_as_basic_value()
+                        {
+                            inkwell::values::ValueKind::Basic(v) => v.into_float_value(),
+                            inkwell::values::ValueKind::Instruction(_) => {
+                                unreachable!("pow always returns a value, never void")
+                            }
+                        }
+                    }
+                    // No boolean type yet, so a comparison's i1 result is
+                    // converted straight to a number: 1.0 or 0.0.
+                    BinOp::Gt => {
+                        let cmp = self
+                            .builder
+                            .build_float_compare(FloatPredicate::OGT, l, r, "gttmp")
+                            .unwrap();
+                        self.builder
+                            .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
+                            .unwrap()
+                    }
+                    BinOp::Lt => {
+                        let cmp = self
+                            .builder
+                            .build_float_compare(FloatPredicate::OLT, l, r, "lttmp")
+                            .unwrap();
+                        self.builder
+                            .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
+                            .unwrap()
+                    }
                 }
             }
         }
