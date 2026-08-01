@@ -1,0 +1,2 @@
+declare 'x' = number '1000'.
+print["This is the total count of non-existent apples " (x)].
