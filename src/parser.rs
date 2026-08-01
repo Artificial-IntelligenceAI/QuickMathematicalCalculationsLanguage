@@ -115,6 +115,7 @@ impl Parser {
         self.advance(); // `declare`
 
         let name_tok = self.advance();
+        let name_span = name_tok.span;
         let name = match name_tok.node {
             Token::Quoted(s) => s,
             other => {
@@ -174,7 +175,7 @@ impl Parser {
                 .suggest("add a '.' at the end, e.g. declare 'x' = number '1000'.")
         })?;
 
-        Ok(Stmt::Declare { name, ty, value })
+        Ok(Stmt::Declare { name, name_span, ty, value })
     }
 
     fn parse_print(&mut self) -> Result<Stmt, QmclError> {

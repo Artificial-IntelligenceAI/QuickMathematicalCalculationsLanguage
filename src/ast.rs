@@ -24,6 +24,9 @@ pub enum PrintPart {
 pub enum Stmt {
     Declare {
         name: String,
+        /// Where the name itself was written, so a redeclaration can be
+        /// pointed at.
+        name_span: Span,
         ty: Type,
         value: Expr,
     },

@@ -7,7 +7,7 @@ use inkwell::values::{BasicMetadataValueEnum, FunctionValue, IntValue, PointerVa
 use inkwell::AddressSpace;
 
 use crate::ast::*;
-use crate::error::QmclError;
+use crate::error::{QmclError, QmclInfo};
 
 pub struct Codegen<'ctx> {
     context: &'ctx Context,
@@ -17,6 +17,9 @@ pub struct Codegen<'ctx> {
     /// Collected instead of aborting at the first one, so a single run can
     /// report every problem in the file, not just the first.
     errors: Vec<QmclError>,
+    /// Notable-but-not-wrong things worth telling the programmer about,
+    /// e.g. a variable being shadowed. Never blocks compilation.
+    notes: Vec<QmclInfo>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -27,6 +30,7 @@ impl<'ctx> Codegen<'ctx> {
             builder: context.create_builder(),
             vars: HashMap::new(),
             errors: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
@@ -39,11 +43,12 @@ impl<'ctx> Codegen<'ctx> {
     /// function, which is compiler plumbing the programmer never writes.
     ///
     /// Returns every semantic error found across the whole program (empty
-    /// means it's safe to run). Keeps compiling subsequent statements after
-    /// hitting one, using placeholder values where needed, purely so more
-    /// errors can surface in the same pass — the resulting module is never
-    /// executed if `errors` isn't empty.
-    pub fn compile_program(&mut self, program: &Program) -> Vec<QmclError> {
+    /// means it's safe to run) alongside any informational notes. Keeps
+    /// compiling subsequent statements after hitting an error, using
+    /// placeholder values where needed, purely so more errors can surface in
+    /// the same pass — the resulting module is never executed if the error
+    /// list isn't empty.
+    pub fn compile_program(&mut self, program: &Program) -> (Vec<QmclError>, Vec<QmclInfo>) {
         let i8_ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i32_ty = self.context.i32_type();
         let printf_ty = i32_ty.fn_type(&[i8_ptr_ty.into()], true);
@@ -62,13 +67,22 @@ impl<'ctx> Codegen<'ctx> {
             .build_return(Some(&i32_ty.const_int(0, false)))
             .unwrap();
 
-        std::mem::take(&mut self.errors)
+        (std::mem::take(&mut self.errors), std::mem::take(&mut self.notes))
     }
 
     fn compile_stmt(&mut self, stmt: &Stmt, printf_fn: FunctionValue<'ctx>) {
         match stmt {
-            Stmt::Declare { name, ty: Type::Number, value } => {
+            Stmt::Declare { name, name_span, ty: Type::Number, value } => {
                 let val = self.compile_expr(value);
+                if self.vars.contains_key(name) {
+                    self.notes.push(
+                        QmclInfo::new(format!(
+                            "'{}' is being redeclared — its previous value is no longer accessible",
+                            name
+                        ))
+                        .at(*name_span),
+                    );
+                }
                 let i64_ty = self.context.i64_type();
                 let ptr = self.builder.build_alloca(i64_ty, name).unwrap();
                 self.builder.build_store(ptr, val).unwrap();

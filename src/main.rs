@@ -12,7 +12,7 @@ use inkwell::context::Context;
 use inkwell::execution_engine::JitFunction;
 use inkwell::OptimizationLevel;
 
-use error::QmclError;
+use error::{QmclError, QmclInfo};
 
 fn fail(err: QmclError, path: &str, source: &str) -> ! {
     eprint!("{}", err.render(path, source));
@@ -31,6 +31,12 @@ fn fail_all(errors: &[QmclError], path: &str, source: &str) -> ! {
         if errors.len() == 1 { "" } else { "s" }
     );
     exit(1);
+}
+
+fn print_notes(notes: &[QmclInfo], path: &str, source: &str) {
+    for n in notes {
+        eprint!("{}", n.render(path, source));
+    }
 }
 
 fn main() {
@@ -63,7 +69,8 @@ fn main() {
 
     let context = Context::create();
     let mut codegen = codegen::Codegen::new(&context, "qmcl_module");
-    let codegen_errors = codegen.compile_program(&program);
+    let (codegen_errors, notes) = codegen.compile_program(&program);
+    print_notes(&notes, path, &source);
     if !codegen_errors.is_empty() {
         fail_all(&codegen_errors, path, &source);
     }

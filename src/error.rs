@@ -72,35 +72,7 @@ impl QmclError {
         out.push_str(&format!("error: {}\n", self.message));
 
         if let Some(span) = self.span {
-            let lines: Vec<&str> = source.lines().collect();
-            // If the span points past the real content (e.g. an
-            // end-of-file position that isn't an actual line in the
-            // source), fall back to the last real line instead of
-            // silently showing no snippet at all.
-            let (line_no, col_no, line_text) = match lines.get(span.line.saturating_sub(1)) {
-                Some(text) => (span.line, span.col, Some(*text)),
-                None => match lines.last() {
-                    Some(text) => (
-                        lines.len(),
-                        text.graphemes(true).count() + 1,
-                        Some(*text),
-                    ),
-                    None => (span.line, span.col, None),
-                },
-            };
-
-            out.push_str(&format!("  --> {}:{}:{}\n", filename, line_no, col_no));
-            out.push_str(&format!("  file:   {}\n", filename));
-            out.push_str(&format!("  line:   {}\n", line_no));
-            out.push_str(&format!("  column: {}\n", col_no));
-            if let Some(line_text) = line_text {
-                let gutter = line_no.to_string();
-                let pad = " ".repeat(gutter.len());
-                out.push_str(&format!("{} |\n", pad));
-                out.push_str(&format!("{} | {}\n", gutter, line_text));
-                let caret_pad = " ".repeat(col_no.saturating_sub(1));
-                out.push_str(&format!("{} | {}^\n", pad, caret_pad));
-            }
+            out.push_str(&render_location(filename, source, span));
         }
 
         if let Some(rule) = &self.rule {
@@ -123,4 +95,70 @@ impl fmt::Display for QmclError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.message)
     }
+}
+
+/// The QMCL Informer's diagnostic type: notable-but-not-wrong things worth
+/// telling the programmer about (e.g. a variable being shadowed). Never
+/// blocks compilation — purely informational.
+#[derive(Debug, Clone)]
+pub struct QmclInfo {
+    pub message: String,
+    pub span: Option<Span>,
+}
+
+impl QmclInfo {
+    pub fn new(message: impl Into<String>) -> Self {
+        QmclInfo {
+            message: message.into(),
+            span: None,
+        }
+    }
+
+    pub fn at(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
+    }
+
+    pub fn render(&self, filename: &str, source: &str) -> String {
+        let mut out = String::new();
+        out.push_str("QMCL Informer\n");
+        out.push_str(&format!("note: {}\n", self.message));
+
+        if let Some(span) = self.span {
+            out.push_str(&render_location(filename, source, span));
+        }
+
+        out
+    }
+}
+
+/// Shared by `QmclError::render` and `QmclInfo::render`: the `-->`
+/// file:line:col line, the labeled file:/line:/column: breakdown, and the
+/// offending source line with a caret under the exact spot. Falls back to
+/// the last real line if the span points past the actual file content
+/// (e.g. an end-of-file position) instead of silently showing nothing.
+fn render_location(filename: &str, source: &str, span: Span) -> String {
+    let mut out = String::new();
+    let lines: Vec<&str> = source.lines().collect();
+    let (line_no, col_no, line_text) = match lines.get(span.line.saturating_sub(1)) {
+        Some(text) => (span.line, span.col, Some(*text)),
+        None => match lines.last() {
+            Some(text) => (lines.len(), text.graphemes(true).count() + 1, Some(*text)),
+            None => (span.line, span.col, None),
+        },
+    };
+
+    out.push_str(&format!("  --> {}:{}:{}\n", filename, line_no, col_no));
+    out.push_str(&format!("  file:   {}\n", filename));
+    out.push_str(&format!("  line:   {}\n", line_no));
+    out.push_str(&format!("  column: {}\n", col_no));
+    if let Some(line_text) = line_text {
+        let gutter = line_no.to_string();
+        let pad = " ".repeat(gutter.len());
+        out.push_str(&format!("{} |\n", pad));
+        out.push_str(&format!("{} | {}\n", gutter, line_text));
+        let caret_pad = " ".repeat(col_no.saturating_sub(1));
+        out.push_str(&format!("{} | {}^\n", pad, caret_pad));
+    }
+    out
 }
