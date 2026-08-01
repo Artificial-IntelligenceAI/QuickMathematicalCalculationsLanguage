@@ -151,11 +151,11 @@ impl Parser {
         let value_tok = self.advance();
         let value = match value_tok.node {
             Token::Quoted(s) => {
-                let n: i64 = s.parse().map_err(|_| {
+                let n: f64 = s.parse().map_err(|_| {
                     QmclError::new(format!("'{}' is not a valid number literal", s))
                         .at(value_tok.span)
-                        .rule("a quoted number literal must contain only digits")
-                        .suggest("use plain digits, e.g. '1000'")
+                        .rule("a quoted number literal must be a valid number")
+                        .suggest("use digits, optionally with a decimal point, e.g. '1000' or '3.14'")
                 })?;
                 Expr::NumberLiteral(n)
             }

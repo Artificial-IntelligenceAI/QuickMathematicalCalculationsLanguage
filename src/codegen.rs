@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
-use inkwell::values::{BasicMetadataValueEnum, FunctionValue, IntValue, PointerValue};
+use inkwell::values::{BasicMetadataValueEnum, FloatValue, FunctionValue, PointerValue};
 use inkwell::AddressSpace;
 
 use crate::ast::*;
@@ -83,8 +83,8 @@ impl<'ctx> Codegen<'ctx> {
                         .at(*name_span),
                     );
                 }
-                let i64_ty = self.context.i64_type();
-                let ptr = self.builder.build_alloca(i64_ty, name).unwrap();
+                let f64_ty = self.context.f64_type();
+                let ptr = self.builder.build_alloca(f64_ty, name).unwrap();
                 self.builder.build_store(ptr, val).unwrap();
                 self.vars.insert(name.clone(), ptr);
             }
@@ -104,7 +104,10 @@ impl<'ctx> Codegen<'ctx> {
                     fmt.push_str(&s.replace('%', "%%"));
                 }
                 PrintPart::Value(expr) => {
-                    fmt.push_str("%lld");
+                    // %.15g: full double precision, but trims trailing
+                    // zeros so a whole number like 1000.0 prints as "1000"
+                    // rather than "1000.000000000000".
+                    fmt.push_str("%.15g");
                     args.push(self.compile_expr(expr).into());
                 }
             }
@@ -122,16 +125,16 @@ impl<'ctx> Codegen<'ctx> {
     /// Never fails outright — on a semantic error, records it in `self.errors`
     /// and returns a placeholder value so codegen can keep walking the rest
     /// of the program looking for more problems.
-    fn compile_expr(&mut self, expr: &Expr) -> IntValue<'ctx> {
+    fn compile_expr(&mut self, expr: &Expr) -> FloatValue<'ctx> {
         match expr {
-            Expr::NumberLiteral(n) => self.context.i64_type().const_int(*n as u64, true),
+            Expr::NumberLiteral(n) => self.context.f64_type().const_float(*n),
             Expr::Var(name, span) => match self.vars.get(name) {
                 Some(ptr) => {
-                    let i64_ty = self.context.i64_type();
+                    let f64_ty = self.context.f64_type();
                     self.builder
-                        .build_load(i64_ty, *ptr, name)
+                        .build_load(f64_ty, *ptr, name)
                         .unwrap()
-                        .into_int_value()
+                        .into_float_value()
                 }
                 None => {
                     self.errors.push(
@@ -143,7 +146,7 @@ impl<'ctx> Codegen<'ctx> {
                                 name
                             )),
                     );
-                    self.context.i64_type().const_int(0, false)
+                    self.context.f64_type().const_float(0.0)
                 }
             },
         }
