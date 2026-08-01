@@ -2,6 +2,14 @@ use crate::ast::*;
 use crate::error::{QmclError, Span, Spanned};
 use crate::lexer::{describe, Token};
 
+/// Lets a number literal use thousands separators for readability, e.g.
+/// '1,000,000' — stripped unconditionally rather than validated for correct
+/// grouping (so '1,00,00' also just parses as 10000), keeping this simple
+/// rather than picking a locale/grouping convention nobody's asked for.
+fn strip_thousands_separators(s: &str) -> String {
+    s.replace(',', "")
+}
+
 pub struct Parser {
     tokens: Vec<Spanned<Token>>,
     pos: usize,
@@ -186,11 +194,12 @@ impl Parser {
         let tok = self.advance();
         match tok.node {
             Token::Quoted(s) => {
-                let n: f64 = s.parse().map_err(|_| {
+                let n: f64 = strip_thousands_separators(&s).parse().map_err(|_| {
                     QmclError::new(format!("'{}' is not a valid number literal", s))
                         .at(tok.span)
                         .rule("a quoted number literal must be a valid number")
                         .suggest("use digits, optionally with a decimal point, e.g. '1000' or '3.14'")
+                        .suggest("thousands separators are allowed too, e.g. '1,000,000'")
                 })?;
                 Ok(Expr::NumberLiteral(n))
             }
@@ -305,7 +314,7 @@ impl Parser {
                 match tok.node {
                     Token::Quoted(s) => {
                         let trimmed = s.strip_suffix('%').unwrap_or(&s);
-                        let n: f64 = trimmed.parse().map_err(|_| {
+                        let n: f64 = strip_thousands_separators(trimmed).parse().map_err(|_| {
                             QmclError::new(format!("'{}' is not a valid percentage", s))
                                 .at(tok.span)
                                 .rule("a quoted percentage must be a number, with an optional trailing '%'")
