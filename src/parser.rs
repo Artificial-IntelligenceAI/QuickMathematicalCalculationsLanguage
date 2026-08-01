@@ -194,6 +194,7 @@ impl Parser {
         let tok = self.advance();
         match tok.node {
             Token::Quoted(s) => {
+                let grouped = s.contains(',');
                 let n: f64 = strip_thousands_separators(&s).parse().map_err(|_| {
                     QmclError::new(format!("'{}' is not a valid number literal", s))
                         .at(tok.span)
@@ -201,7 +202,7 @@ impl Parser {
                         .suggest("use digits, optionally with a decimal point, e.g. '1000' or '3.14'")
                         .suggest("thousands separators are allowed too, e.g. '1,000,000'")
                 })?;
-                Ok(Expr::NumberLiteral(n))
+                Ok(Expr::NumberLiteral(n, grouped))
             }
             Token::LParen => {
                 let ident_tok = self.advance();
@@ -314,13 +315,14 @@ impl Parser {
                 match tok.node {
                     Token::Quoted(s) => {
                         let trimmed = s.strip_suffix('%').unwrap_or(&s);
+                        let grouped = trimmed.contains(',');
                         let n: f64 = strip_thousands_separators(trimmed).parse().map_err(|_| {
                             QmclError::new(format!("'{}' is not a valid percentage", s))
                                 .at(tok.span)
                                 .rule("a quoted percentage must be a number, with an optional trailing '%'")
                                 .suggest("use e.g. '100%' or '100' — both mean the same thing")
                         })?;
-                        Expr::NumberLiteral(n / 100.0)
+                        Expr::NumberLiteral(n / 100.0, grouped)
                     }
                     other => {
                         return Err(QmclError::new(format!(

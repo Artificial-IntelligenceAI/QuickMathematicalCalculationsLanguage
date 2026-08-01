@@ -29,7 +29,9 @@ pub enum BinOp {
 pub enum Expr {
     /// Also used for a Percentage literal, already normalized to a fraction
     /// by the time it reaches here (parsing strips the '%' and divides).
-    NumberLiteral(f64),
+    /// The bool is whether the original literal used thousands separators
+    /// (e.g. '1,000,000') — carried through so printing can reproduce them.
+    NumberLiteral(f64, bool),
     StringLiteral(String),
     BooleanLiteral(bool),
     /// A variable reference (the `x` in `(x)`), carrying where it was

@@ -9,15 +9,25 @@ use inkwell::{AddressSpace, FloatPredicate};
 use crate::ast::*;
 use crate::error::{QmclError, QmclInfo, Span};
 
+/// macOS/BSD libc's LC_NUMERIC value (from <locale.h>) — needed to call
+/// setlocale() so printf's `'` thousands-grouping flag actually does
+/// anything (it's a no-op in the default "C" locale). This is
+/// platform-specific; glibc uses a different constant, so this would need
+/// adjusting if QMCL ever targets Linux.
+const LC_NUMERIC: i32 = 4;
+
 /// The result of compiling an expression. Not every expression is a number
 /// anymore, so callers (print formatting, arithmetic) need to know which
 /// kind they actually got.
 enum Value<'ctx> {
-    Number(FloatValue<'ctx>),
+    /// The bool is whether this value should print with thousands
+    /// separators (e.g. 1,000,000) — true if the literal it came from used
+    /// them, or if either side of an arithmetic operation did.
+    Number(FloatValue<'ctx>, bool),
     /// Same underlying f64 as Number (already normalized to a fraction —
     /// 100% is stored as 1.0), kept as its own variant purely so printing
     /// knows to re-scale by 100 and append '%'.
-    Percentage(FloatValue<'ctx>),
+    Percentage(FloatValue<'ctx>, bool),
     Boolean(IntValue<'ctx>),
     Str(PointerValue<'ctx>),
 }
@@ -26,7 +36,8 @@ pub struct Codegen<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
-    vars: HashMap<String, (PointerValue<'ctx>, Type)>,
+    /// Type, plus whether the variable's value should print grouped.
+    vars: HashMap<String, (PointerValue<'ctx>, Type, bool)>,
     /// Collected instead of aborting at the first one, so a single run can
     /// report every problem in the file, not just the first.
     errors: Vec<QmclError>,
@@ -75,10 +86,31 @@ impl<'ctx> Codegen<'ctx> {
         let pow_ty = f64_ty.fn_type(&[f64_ty.into(), f64_ty.into()], false);
         self.pow_fn = Some(self.module.add_function("pow", pow_ty, None));
 
+        let setlocale_ty = i8_ptr_ty.fn_type(&[i32_ty.into(), i8_ptr_ty.into()], false);
+        let setlocale_fn = self.module.add_function("setlocale", setlocale_ty, None);
+
         let main_ty = i32_ty.fn_type(&[], false);
         let main_fn = self.module.add_function("main", main_ty, None);
         let entry = self.context.append_basic_block(main_fn, "entry");
         self.builder.position_at_end(entry);
+
+        // printf's `'` thousands-grouping flag is a no-op under the default
+        // "C" locale, so a locale with actual digit grouping has to be set
+        // before any print statement that might use it.
+        let locale_name = self
+            .builder
+            .build_global_string_ptr("en_US.UTF-8", "locale_name")
+            .unwrap();
+        self.builder
+            .build_call(
+                setlocale_fn,
+                &[
+                    i32_ty.const_int(LC_NUMERIC as u64, true).into(),
+                    locale_name.as_pointer_value().into(),
+                ],
+                "setlocale_call",
+            )
+            .unwrap();
 
         for stmt in program {
             self.compile_stmt(stmt, printf_fn);
@@ -107,11 +139,11 @@ impl<'ctx> Codegen<'ctx> {
                 let val = self.compile_expr(value);
                 match ty {
                     Type::Number | Type::Percentage => {
-                        let f = self.as_number(val, *name_span);
+                        let (f, grouped) = self.as_number(val, *name_span);
                         let f64_ty = self.context.f64_type();
                         let ptr = self.builder.build_alloca(f64_ty, name).unwrap();
                         self.builder.build_store(ptr, f).unwrap();
-                        self.vars.insert(name.clone(), (ptr, *ty));
+                        self.vars.insert(name.clone(), (ptr, *ty, grouped));
                     }
                     Type::Boolean => {
                         // Guaranteed to already be a Value::Boolean — the
@@ -123,7 +155,7 @@ impl<'ctx> Codegen<'ctx> {
                         let bool_ty = self.context.bool_type();
                         let ptr = self.builder.build_alloca(bool_ty, name).unwrap();
                         self.builder.build_store(ptr, b).unwrap();
-                        self.vars.insert(name.clone(), (ptr, *ty));
+                        self.vars.insert(name.clone(), (ptr, *ty, false));
                     }
                     Type::String => {
                         // Guaranteed to already be a Value::Str — the
@@ -135,7 +167,7 @@ impl<'ctx> Codegen<'ctx> {
                         let ptr_ty = self.context.ptr_type(AddressSpace::default());
                         let ptr = self.builder.build_alloca(ptr_ty, name).unwrap();
                         self.builder.build_store(ptr, s).unwrap();
-                        self.vars.insert(name.clone(), (ptr, *ty));
+                        self.vars.insert(name.clone(), (ptr, *ty, false));
                     }
                 }
             }
@@ -157,17 +189,19 @@ impl<'ctx> Codegen<'ctx> {
                 PrintPart::Value(expr) => {
                     let val = self.compile_expr(expr);
                     match val {
-                        Value::Number(f) => {
+                        Value::Number(f, grouped) => {
                             // %.15g: full double precision, but trims
                             // trailing zeros so a whole number like 1000.0
                             // prints as "1000" rather than "1000.000...".
-                            fmt.push_str("%.15g");
+                            // The `'` flag (needs the locale set up above)
+                            // adds thousands separators.
+                            fmt.push_str(if grouped { "%'.15g" } else { "%.15g" });
                             args.push(f.into());
                         }
-                        Value::Percentage(f) => {
+                        Value::Percentage(f, grouped) => {
                             let hundred = self.context.f64_type().const_float(100.0);
                             let scaled = self.builder.build_float_mul(f, hundred, "pcttmp").unwrap();
-                            fmt.push_str("%.15g%%"); // %% is a literal '%' to printf
+                            fmt.push_str(if grouped { "%'.15g%%" } else { "%.15g%%" }); // %% is a literal '%' to printf
                             args.push(scaled.into());
                         }
                         Value::Boolean(b) => {
@@ -211,7 +245,9 @@ impl<'ctx> Codegen<'ctx> {
     /// of the program looking for more problems.
     fn compile_expr(&mut self, expr: &Expr) -> Value<'ctx> {
         match expr {
-            Expr::NumberLiteral(n) => Value::Number(self.context.f64_type().const_float(*n)),
+            Expr::NumberLiteral(n, grouped) => {
+                Value::Number(self.context.f64_type().const_float(*n), *grouped)
+            }
             Expr::StringLiteral(s) => {
                 let ptr = self
                     .builder
@@ -224,8 +260,9 @@ impl<'ctx> Codegen<'ctx> {
                 Value::Boolean(self.context.bool_type().const_int(*b as u64, false))
             }
             Expr::Var(name, span) => match self.vars.get(name) {
-                Some((ptr, ty)) => {
+                Some((ptr, ty, grouped)) => {
                     let ptr = *ptr;
+                    let grouped = *grouped;
                     match ty {
                         Type::Number => {
                             let v = self
@@ -233,7 +270,7 @@ impl<'ctx> Codegen<'ctx> {
                                 .build_load(self.context.f64_type(), ptr, name)
                                 .unwrap()
                                 .into_float_value();
-                            Value::Number(v)
+                            Value::Number(v, grouped)
                         }
                         Type::Percentage => {
                             let v = self
@@ -241,7 +278,7 @@ impl<'ctx> Codegen<'ctx> {
                                 .build_load(self.context.f64_type(), ptr, name)
                                 .unwrap()
                                 .into_float_value();
-                            Value::Percentage(v)
+                            Value::Percentage(v, grouped)
                         }
                         Type::Boolean => {
                             let v = self
@@ -271,19 +308,30 @@ impl<'ctx> Codegen<'ctx> {
                                 name
                             )),
                     );
-                    Value::Number(self.context.f64_type().const_float(0.0))
+                    Value::Number(self.context.f64_type().const_float(0.0), false)
                 }
             },
             Expr::BinaryOp(op, left, right, op_span) => {
                 let l_val = self.compile_expr(left);
                 let r_val = self.compile_expr(right);
-                let l = self.as_number(l_val, *op_span);
-                let r = self.as_number(r_val, *op_span);
+                let (l, l_grouped) = self.as_number(l_val, *op_span);
+                let (r, r_grouped) = self.as_number(r_val, *op_span);
+                // If either side wants thousands separators, the result
+                // does too.
+                let grouped = l_grouped || r_grouped;
                 match op {
-                    BinOp::Add => Value::Number(self.builder.build_float_add(l, r, "addtmp").unwrap()),
-                    BinOp::Sub => Value::Number(self.builder.build_float_sub(l, r, "subtmp").unwrap()),
-                    BinOp::Mul => Value::Number(self.builder.build_float_mul(l, r, "multmp").unwrap()),
-                    BinOp::Div => Value::Number(self.builder.build_float_div(l, r, "divtmp").unwrap()),
+                    BinOp::Add => {
+                        Value::Number(self.builder.build_float_add(l, r, "addtmp").unwrap(), grouped)
+                    }
+                    BinOp::Sub => {
+                        Value::Number(self.builder.build_float_sub(l, r, "subtmp").unwrap(), grouped)
+                    }
+                    BinOp::Mul => {
+                        Value::Number(self.builder.build_float_mul(l, r, "multmp").unwrap(), grouped)
+                    }
+                    BinOp::Div => {
+                        Value::Number(self.builder.build_float_div(l, r, "divtmp").unwrap(), grouped)
+                    }
                     BinOp::Pow => {
                         let pow_fn = self.pow_fn.expect("pow_fn set at start of compile_program");
                         let result = match self
@@ -297,7 +345,7 @@ impl<'ctx> Codegen<'ctx> {
                                 unreachable!("pow always returns a value, never void")
                             }
                         };
-                        Value::Number(result)
+                        Value::Number(result, grouped)
                     }
                     // No boolean type is produced here (comparisons predate
                     // Boolean and still yield a plain number) — 1.0 or 0.0.
@@ -310,6 +358,7 @@ impl<'ctx> Codegen<'ctx> {
                             self.builder
                                 .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
                                 .unwrap(),
+                            false,
                         )
                     }
                     BinOp::Lt => {
@@ -321,6 +370,7 @@ impl<'ctx> Codegen<'ctx> {
                             self.builder
                                 .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
                                 .unwrap(),
+                            false,
                         )
                     }
                 }
@@ -328,12 +378,13 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Coerces a `Value` into a float for arithmetic, reporting a clear
-    /// error (rather than emitting broken IR) if it's actually a string or
-    /// boolean — those aren't usable in arithmetic yet.
-    fn as_number(&mut self, v: Value<'ctx>, span: Span) -> FloatValue<'ctx> {
+    /// Coerces a `Value` into a float (plus its "should print grouped"
+    /// flag) for arithmetic, reporting a clear error (rather than emitting
+    /// broken IR) if it's actually a string or boolean — those aren't
+    /// usable in arithmetic yet.
+    fn as_number(&mut self, v: Value<'ctx>, span: Span) -> (FloatValue<'ctx>, bool) {
         match v {
-            Value::Number(f) | Value::Percentage(f) => f,
+            Value::Number(f, grouped) | Value::Percentage(f, grouped) => (f, grouped),
             Value::Boolean(_) => {
                 self.errors.push(
                     QmclError::new("a boolean value can't be used in arithmetic")
@@ -341,7 +392,7 @@ impl<'ctx> Codegen<'ctx> {
                         .rule("arithmetic operators only work on number/percentage values")
                         .suggest("only use +, -, *, /, ^ with number or percentage values"),
                 );
-                self.context.f64_type().const_float(0.0)
+                (self.context.f64_type().const_float(0.0), false)
             }
             Value::Str(_) => {
                 self.errors.push(
@@ -350,7 +401,7 @@ impl<'ctx> Codegen<'ctx> {
                         .rule("arithmetic operators only work on number/percentage values")
                         .suggest("only use +, -, *, /, ^ with number or percentage values"),
                 );
-                self.context.f64_type().const_float(0.0)
+                (self.context.f64_type().const_float(0.0), false)
             }
         }
     }
