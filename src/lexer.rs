@@ -110,7 +110,7 @@ const KEYWORDS: &[(&str, fn() -> Token)] = &[
     ("print", || Token::Print),
 ];
 
-const TYPE_NAMES: &[&str] = &["number"];
+const TYPE_NAMES: &[&str] = &["number", "string", "boolean", "percentage"];
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {

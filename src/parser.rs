@@ -121,6 +121,7 @@ impl Parser {
     /// picking chained-comparison semantics nobody's asked for yet.
     fn parse_comparison(&mut self) -> Result<Expr, QmclError> {
         let left = self.parse_additive()?;
+        let op_span = self.peek_span();
         let op = match self.peek() {
             Token::Greater => BinOp::Gt,
             Token::Less => BinOp::Lt,
@@ -128,13 +129,14 @@ impl Parser {
         };
         self.advance();
         let right = self.parse_additive()?;
-        Ok(Expr::BinaryOp(op, Box::new(left), Box::new(right)))
+        Ok(Expr::BinaryOp(op, Box::new(left), Box::new(right), op_span))
     }
 
     /// additive := multiplicative (('+' | '-') multiplicative)*  — left-associative.
     fn parse_additive(&mut self) -> Result<Expr, QmclError> {
         let mut left = self.parse_multiplicative()?;
         loop {
+            let op_span = self.peek_span();
             let op = match self.peek() {
                 Token::Plus => BinOp::Add,
                 Token::Minus => BinOp::Sub,
@@ -142,7 +144,7 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_multiplicative()?;
-            left = Expr::BinaryOp(op, Box::new(left), Box::new(right));
+            left = Expr::BinaryOp(op, Box::new(left), Box::new(right), op_span);
         }
         Ok(left)
     }
@@ -151,6 +153,7 @@ impl Parser {
     fn parse_multiplicative(&mut self) -> Result<Expr, QmclError> {
         let mut left = self.parse_power()?;
         loop {
+            let op_span = self.peek_span();
             let op = match self.peek() {
                 Token::Star => BinOp::Mul,
                 Token::Slash => BinOp::Div,
@@ -158,7 +161,7 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_power()?;
-            left = Expr::BinaryOp(op, Box::new(left), Box::new(right));
+            left = Expr::BinaryOp(op, Box::new(left), Box::new(right), op_span);
         }
         Ok(left)
     }
@@ -168,10 +171,11 @@ impl Parser {
     /// binds tighter than */÷.
     fn parse_power(&mut self) -> Result<Expr, QmclError> {
         let base = self.parse_atom()?;
+        let op_span = self.peek_span();
         if *self.peek() == Token::Caret {
             self.advance();
             let exp = self.parse_power()?;
-            Ok(Expr::BinaryOp(BinOp::Pow, Box::new(base), Box::new(exp)))
+            Ok(Expr::BinaryOp(BinOp::Pow, Box::new(base), Box::new(exp), op_span))
         } else {
             Ok(base)
         }
@@ -246,6 +250,9 @@ impl Parser {
         let ty_tok = self.advance();
         let ty = match ty_tok.node {
             Token::TypeName(t) if t == "number" => Type::Number,
+            Token::TypeName(t) if t == "string" => Type::String,
+            Token::TypeName(t) if t == "boolean" => Type::Boolean,
+            Token::TypeName(t) if t == "percentage" => Type::Percentage,
             other => {
                 return Err(QmclError::new(format!(
                     "expected a type name, found {}",
@@ -253,11 +260,71 @@ impl Parser {
                 ))
                 .at(ty_tok.span)
                 .rule("a type name must follow the '=' in a declaration")
-                .suggest("use 'number' — it's currently the only supported type"))
+                .suggest("use 'number', 'string', 'boolean', or 'percentage'"))
             }
         };
 
-        let value = self.parse_expr()?;
+        // number is the only type with full expression support (arithmetic,
+        // variable references) right now — string/boolean/percentage take a
+        // single literal value each, parsed according to their own rules.
+        let value = match ty {
+            Type::Number => self.parse_expr()?,
+            Type::String => {
+                let tok = self.advance();
+                match tok.node {
+                    Token::Quoted(s) => Expr::StringLiteral(s),
+                    other => {
+                        return Err(QmclError::new(format!(
+                            "expected a quoted string value, found {}",
+                            describe(&other)
+                        ))
+                        .at(tok.span)
+                        .rule("a string value must be written in quotes")
+                        .suggest("write the value in quotes, e.g. string 'Hello, World!'"))
+                    }
+                }
+            }
+            Type::Boolean => {
+                let tok = self.advance();
+                match tok.node {
+                    Token::Quoted(s) if s == "true" => Expr::BooleanLiteral(true),
+                    Token::Quoted(s) if s == "false" => Expr::BooleanLiteral(false),
+                    other => {
+                        return Err(QmclError::new(format!(
+                            "expected 'true' or 'false', found {}",
+                            describe(&other)
+                        ))
+                        .at(tok.span)
+                        .rule("a boolean value must be exactly 'true' or 'false'")
+                        .suggest("write boolean 'true' or boolean 'false'"))
+                    }
+                }
+            }
+            Type::Percentage => {
+                let tok = self.advance();
+                match tok.node {
+                    Token::Quoted(s) => {
+                        let trimmed = s.strip_suffix('%').unwrap_or(&s);
+                        let n: f64 = trimmed.parse().map_err(|_| {
+                            QmclError::new(format!("'{}' is not a valid percentage", s))
+                                .at(tok.span)
+                                .rule("a quoted percentage must be a number, with an optional trailing '%'")
+                                .suggest("use e.g. '100%' or '100' — both mean the same thing")
+                        })?;
+                        Expr::NumberLiteral(n / 100.0)
+                    }
+                    other => {
+                        return Err(QmclError::new(format!(
+                            "expected a quoted percentage value, found {}",
+                            describe(&other)
+                        ))
+                        .at(tok.span)
+                        .rule("a percentage value must be written in quotes")
+                        .suggest("write the value in quotes, e.g. percentage '100%' or percentage '100'"))
+                    }
+                }
+            }
+        };
 
         self.expect(&Token::Period).map_err(|e| {
             e.rule("every statement must end with a '.'")

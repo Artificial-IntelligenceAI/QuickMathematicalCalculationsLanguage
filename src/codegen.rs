@@ -3,17 +3,30 @@ use std::collections::HashMap;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
-use inkwell::values::{BasicMetadataValueEnum, FloatValue, FunctionValue, PointerValue};
+use inkwell::values::{BasicMetadataValueEnum, FloatValue, FunctionValue, IntValue, PointerValue};
 use inkwell::{AddressSpace, FloatPredicate};
 
 use crate::ast::*;
-use crate::error::{QmclError, QmclInfo};
+use crate::error::{QmclError, QmclInfo, Span};
+
+/// The result of compiling an expression. Not every expression is a number
+/// anymore, so callers (print formatting, arithmetic) need to know which
+/// kind they actually got.
+enum Value<'ctx> {
+    Number(FloatValue<'ctx>),
+    /// Same underlying f64 as Number (already normalized to a fraction —
+    /// 100% is stored as 1.0), kept as its own variant purely so printing
+    /// knows to re-scale by 100 and append '%'.
+    Percentage(FloatValue<'ctx>),
+    Boolean(IntValue<'ctx>),
+    Str(PointerValue<'ctx>),
+}
 
 pub struct Codegen<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
-    vars: HashMap<String, PointerValue<'ctx>>,
+    vars: HashMap<String, (PointerValue<'ctx>, Type)>,
     /// Collected instead of aborting at the first one, so a single run can
     /// report every problem in the file, not just the first.
     errors: Vec<QmclError>,
@@ -80,8 +93,7 @@ impl<'ctx> Codegen<'ctx> {
 
     fn compile_stmt(&mut self, stmt: &Stmt, printf_fn: FunctionValue<'ctx>) {
         match stmt {
-            Stmt::Declare { name, name_span, ty: Type::Number, value } => {
-                let val = self.compile_expr(value);
+            Stmt::Declare { name, name_span, ty, value } => {
                 if self.vars.contains_key(name) {
                     self.notes.push(
                         QmclInfo::new(format!(
@@ -91,10 +103,41 @@ impl<'ctx> Codegen<'ctx> {
                         .at(*name_span),
                     );
                 }
-                let f64_ty = self.context.f64_type();
-                let ptr = self.builder.build_alloca(f64_ty, name).unwrap();
-                self.builder.build_store(ptr, val).unwrap();
-                self.vars.insert(name.clone(), ptr);
+
+                let val = self.compile_expr(value);
+                match ty {
+                    Type::Number | Type::Percentage => {
+                        let f = self.as_number(val, *name_span);
+                        let f64_ty = self.context.f64_type();
+                        let ptr = self.builder.build_alloca(f64_ty, name).unwrap();
+                        self.builder.build_store(ptr, f).unwrap();
+                        self.vars.insert(name.clone(), (ptr, *ty));
+                    }
+                    Type::Boolean => {
+                        // Guaranteed to already be a Value::Boolean — the
+                        // parser only ever produces a BooleanLiteral here.
+                        let b = match val {
+                            Value::Boolean(b) => b,
+                            _ => unreachable!("parser only allows a boolean literal here"),
+                        };
+                        let bool_ty = self.context.bool_type();
+                        let ptr = self.builder.build_alloca(bool_ty, name).unwrap();
+                        self.builder.build_store(ptr, b).unwrap();
+                        self.vars.insert(name.clone(), (ptr, *ty));
+                    }
+                    Type::String => {
+                        // Guaranteed to already be a Value::Str — the
+                        // parser only ever produces a StringLiteral here.
+                        let s = match val {
+                            Value::Str(s) => s,
+                            _ => unreachable!("parser only allows a string literal here"),
+                        };
+                        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                        let ptr = self.builder.build_alloca(ptr_ty, name).unwrap();
+                        self.builder.build_store(ptr, s).unwrap();
+                        self.vars.insert(name.clone(), (ptr, *ty));
+                    }
+                }
             }
             Stmt::Print { parts } => self.compile_print(parts, printf_fn),
         }
@@ -112,11 +155,44 @@ impl<'ctx> Codegen<'ctx> {
                     fmt.push_str(&s.replace('%', "%%"));
                 }
                 PrintPart::Value(expr) => {
-                    // %.15g: full double precision, but trims trailing
-                    // zeros so a whole number like 1000.0 prints as "1000"
-                    // rather than "1000.000000000000".
-                    fmt.push_str("%.15g");
-                    args.push(self.compile_expr(expr).into());
+                    let val = self.compile_expr(expr);
+                    match val {
+                        Value::Number(f) => {
+                            // %.15g: full double precision, but trims
+                            // trailing zeros so a whole number like 1000.0
+                            // prints as "1000" rather than "1000.000...".
+                            fmt.push_str("%.15g");
+                            args.push(f.into());
+                        }
+                        Value::Percentage(f) => {
+                            let hundred = self.context.f64_type().const_float(100.0);
+                            let scaled = self.builder.build_float_mul(f, hundred, "pcttmp").unwrap();
+                            fmt.push_str("%.15g%%"); // %% is a literal '%' to printf
+                            args.push(scaled.into());
+                        }
+                        Value::Boolean(b) => {
+                            let true_str = self
+                                .builder
+                                .build_global_string_ptr("true", "true_str")
+                                .unwrap()
+                                .as_pointer_value();
+                            let false_str = self
+                                .builder
+                                .build_global_string_ptr("false", "false_str")
+                                .unwrap()
+                                .as_pointer_value();
+                            let selected = self
+                                .builder
+                                .build_select(b, true_str, false_str, "boolstr")
+                                .unwrap();
+                            fmt.push_str("%s");
+                            args.push(selected.into());
+                        }
+                        Value::Str(s) => {
+                            fmt.push_str("%s");
+                            args.push(s.into());
+                        }
+                    }
                 }
             }
         }
@@ -133,16 +209,57 @@ impl<'ctx> Codegen<'ctx> {
     /// Never fails outright — on a semantic error, records it in `self.errors`
     /// and returns a placeholder value so codegen can keep walking the rest
     /// of the program looking for more problems.
-    fn compile_expr(&mut self, expr: &Expr) -> FloatValue<'ctx> {
+    fn compile_expr(&mut self, expr: &Expr) -> Value<'ctx> {
         match expr {
-            Expr::NumberLiteral(n) => self.context.f64_type().const_float(*n),
+            Expr::NumberLiteral(n) => Value::Number(self.context.f64_type().const_float(*n)),
+            Expr::StringLiteral(s) => {
+                let ptr = self
+                    .builder
+                    .build_global_string_ptr(s, "strlit")
+                    .unwrap()
+                    .as_pointer_value();
+                Value::Str(ptr)
+            }
+            Expr::BooleanLiteral(b) => {
+                Value::Boolean(self.context.bool_type().const_int(*b as u64, false))
+            }
             Expr::Var(name, span) => match self.vars.get(name) {
-                Some(ptr) => {
-                    let f64_ty = self.context.f64_type();
-                    self.builder
-                        .build_load(f64_ty, *ptr, name)
-                        .unwrap()
-                        .into_float_value()
+                Some((ptr, ty)) => {
+                    let ptr = *ptr;
+                    match ty {
+                        Type::Number => {
+                            let v = self
+                                .builder
+                                .build_load(self.context.f64_type(), ptr, name)
+                                .unwrap()
+                                .into_float_value();
+                            Value::Number(v)
+                        }
+                        Type::Percentage => {
+                            let v = self
+                                .builder
+                                .build_load(self.context.f64_type(), ptr, name)
+                                .unwrap()
+                                .into_float_value();
+                            Value::Percentage(v)
+                        }
+                        Type::Boolean => {
+                            let v = self
+                                .builder
+                                .build_load(self.context.bool_type(), ptr, name)
+                                .unwrap()
+                                .into_int_value();
+                            Value::Boolean(v)
+                        }
+                        Type::String => {
+                            let v = self
+                                .builder
+                                .build_load(self.context.ptr_type(AddressSpace::default()), ptr, name)
+                                .unwrap()
+                                .into_pointer_value();
+                            Value::Str(v)
+                        }
+                    }
                 }
                 None => {
                     self.errors.push(
@@ -154,20 +271,22 @@ impl<'ctx> Codegen<'ctx> {
                                 name
                             )),
                     );
-                    self.context.f64_type().const_float(0.0)
+                    Value::Number(self.context.f64_type().const_float(0.0))
                 }
             },
-            Expr::BinaryOp(op, left, right) => {
-                let l = self.compile_expr(left);
-                let r = self.compile_expr(right);
+            Expr::BinaryOp(op, left, right, op_span) => {
+                let l_val = self.compile_expr(left);
+                let r_val = self.compile_expr(right);
+                let l = self.as_number(l_val, *op_span);
+                let r = self.as_number(r_val, *op_span);
                 match op {
-                    BinOp::Add => self.builder.build_float_add(l, r, "addtmp").unwrap(),
-                    BinOp::Sub => self.builder.build_float_sub(l, r, "subtmp").unwrap(),
-                    BinOp::Mul => self.builder.build_float_mul(l, r, "multmp").unwrap(),
-                    BinOp::Div => self.builder.build_float_div(l, r, "divtmp").unwrap(),
+                    BinOp::Add => Value::Number(self.builder.build_float_add(l, r, "addtmp").unwrap()),
+                    BinOp::Sub => Value::Number(self.builder.build_float_sub(l, r, "subtmp").unwrap()),
+                    BinOp::Mul => Value::Number(self.builder.build_float_mul(l, r, "multmp").unwrap()),
+                    BinOp::Div => Value::Number(self.builder.build_float_div(l, r, "divtmp").unwrap()),
                     BinOp::Pow => {
                         let pow_fn = self.pow_fn.expect("pow_fn set at start of compile_program");
-                        match self
+                        let result = match self
                             .builder
                             .build_call(pow_fn, &[l.into(), r.into()], "powtmp")
                             .unwrap()
@@ -177,29 +296,61 @@ impl<'ctx> Codegen<'ctx> {
                             inkwell::values::ValueKind::Instruction(_) => {
                                 unreachable!("pow always returns a value, never void")
                             }
-                        }
+                        };
+                        Value::Number(result)
                     }
-                    // No boolean type yet, so a comparison's i1 result is
-                    // converted straight to a number: 1.0 or 0.0.
+                    // No boolean type is produced here (comparisons predate
+                    // Boolean and still yield a plain number) — 1.0 or 0.0.
                     BinOp::Gt => {
                         let cmp = self
                             .builder
                             .build_float_compare(FloatPredicate::OGT, l, r, "gttmp")
                             .unwrap();
-                        self.builder
-                            .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
-                            .unwrap()
+                        Value::Number(
+                            self.builder
+                                .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
+                                .unwrap(),
+                        )
                     }
                     BinOp::Lt => {
                         let cmp = self
                             .builder
                             .build_float_compare(FloatPredicate::OLT, l, r, "lttmp")
                             .unwrap();
-                        self.builder
-                            .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
-                            .unwrap()
+                        Value::Number(
+                            self.builder
+                                .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
+                                .unwrap(),
+                        )
                     }
                 }
+            }
+        }
+    }
+
+    /// Coerces a `Value` into a float for arithmetic, reporting a clear
+    /// error (rather than emitting broken IR) if it's actually a string or
+    /// boolean — those aren't usable in arithmetic yet.
+    fn as_number(&mut self, v: Value<'ctx>, span: Span) -> FloatValue<'ctx> {
+        match v {
+            Value::Number(f) | Value::Percentage(f) => f,
+            Value::Boolean(_) => {
+                self.errors.push(
+                    QmclError::new("a boolean value can't be used in arithmetic")
+                        .at(span)
+                        .rule("arithmetic operators only work on number/percentage values")
+                        .suggest("only use +, -, *, /, ^ with number or percentage values"),
+                );
+                self.context.f64_type().const_float(0.0)
+            }
+            Value::Str(_) => {
+                self.errors.push(
+                    QmclError::new("a string value can't be used in arithmetic")
+                        .at(span)
+                        .rule("arithmetic operators only work on number/percentage values")
+                        .suggest("only use +, -, *, /, ^ with number or percentage values"),
+                );
+                self.context.f64_type().const_float(0.0)
             }
         }
     }

@@ -1,6 +1,12 @@
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Type {
     Number,
+    String,
+    Boolean,
+    /// Stored normalized as a fraction (100% -> 1.0, 50% -> 0.5) so it's
+    /// directly usable in arithmetic; printing re-multiplies by 100 and
+    /// re-appends '%' for display.
+    Percentage,
 }
 
 use crate::error::Span;
@@ -21,12 +27,18 @@ pub enum BinOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
+    /// Also used for a Percentage literal, already normalized to a fraction
+    /// by the time it reaches here (parsing strips the '%' and divides).
     NumberLiteral(f64),
+    StringLiteral(String),
+    BooleanLiteral(bool),
     /// A variable reference (the `x` in `(x)`), carrying where it was
     /// written so codegen can point at it if the variable turns out to be
     /// undeclared.
     Var(String, Span),
-    BinaryOp(BinOp, Box<Expr>, Box<Expr>),
+    /// Carries the operator's own span so a type-mismatch error (e.g. `+`
+    /// between a string and a number) has somewhere to point.
+    BinaryOp(BinOp, Box<Expr>, Box<Expr>, Span),
 }
 
 #[derive(Debug, Clone, PartialEq)]
