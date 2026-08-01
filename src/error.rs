@@ -1,5 +1,7 @@
 use std::fmt;
 
+use unicode_segmentation::UnicodeSegmentation;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub line: usize, // 1-indexed
@@ -61,14 +63,30 @@ impl QmclError {
         out.push_str(&format!("error: {}\n", self.message));
 
         if let Some(span) = self.span {
-            out.push_str(&format!("  --> {}:{}:{}\n", filename, span.line, span.col));
             let lines: Vec<&str> = source.lines().collect();
-            if let Some(line_text) = lines.get(span.line.saturating_sub(1)) {
-                let gutter = span.line.to_string();
+            // If the span points past the real content (e.g. an
+            // end-of-file position that isn't an actual line in the
+            // source), fall back to the last real line instead of
+            // silently showing no snippet at all.
+            let (line_no, col_no, line_text) = match lines.get(span.line.saturating_sub(1)) {
+                Some(text) => (span.line, span.col, Some(*text)),
+                None => match lines.last() {
+                    Some(text) => (
+                        lines.len(),
+                        text.graphemes(true).count() + 1,
+                        Some(*text),
+                    ),
+                    None => (span.line, span.col, None),
+                },
+            };
+
+            out.push_str(&format!("  --> {}:{}:{}\n", filename, line_no, col_no));
+            if let Some(line_text) = line_text {
+                let gutter = line_no.to_string();
                 let pad = " ".repeat(gutter.len());
                 out.push_str(&format!("{} |\n", pad));
                 out.push_str(&format!("{} | {}\n", gutter, line_text));
-                let caret_pad = " ".repeat(span.col.saturating_sub(1));
+                let caret_pad = " ".repeat(col_no.saturating_sub(1));
                 out.push_str(&format!("{} | {}^\n", pad, caret_pad));
             }
         }

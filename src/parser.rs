@@ -20,6 +20,19 @@ impl Parser {
         self.tokens[self.pos].span
     }
 
+    /// The span to blame for an error about the current token. At EOF,
+    /// there's no real content at the synthetic "end of file" position (it
+    /// may even be a line/column past anything that actually exists in the
+    /// source), so point at the last real token instead — that's where the
+    /// user actually needs to look to fix things.
+    fn error_span(&self) -> Span {
+        if *self.peek() == Token::Eof && self.pos > 0 {
+            self.tokens[self.pos - 1].span
+        } else {
+            self.peek_span()
+        }
+    }
+
     fn advance(&mut self) -> Spanned<Token> {
         let t = self.tokens[self.pos].clone();
         if self.pos + 1 < self.tokens.len() {
@@ -39,7 +52,7 @@ impl Parser {
                 describe(expected),
                 describe(self.peek())
             ))
-            .at(self.peek_span()))
+            .at(self.error_span()))
         }
     }
 
@@ -59,7 +72,7 @@ impl Parser {
                 "expected a statement, found {}",
                 describe(other)
             ))
-            .at(self.peek_span())
+            .at(self.error_span())
             .suggest("statements start with 'declare' or 'print'")),
         }
     }
@@ -158,7 +171,7 @@ impl Parser {
                         "unexpected {} inside print[...]",
                         describe(&other)
                     ))
-                    .at(self.peek_span())
+                    .at(self.error_span())
                     .suggest("print[...] only accepts \"text\" and (variable) references"))
                 }
             }
