@@ -56,12 +56,45 @@ impl Parser {
         }
     }
 
-    pub fn parse_program(&mut self) -> Result<Program, QmclError> {
+    /// Returns every statement that parsed successfully alongside every
+    /// error found — a parse error doesn't stop the parser, it recovers to
+    /// the next likely statement boundary (see `synchronize`) and keeps
+    /// going, so a file with several mistakes reports all of them at once
+    /// instead of just the first. An empty error list means it's safe to
+    /// hand `Program` to codegen.
+    pub fn parse_program(&mut self) -> (Program, Vec<QmclError>) {
         let mut stmts = Vec::new();
+        let mut errors = Vec::new();
         while *self.peek() != Token::Eof {
-            stmts.push(self.parse_stmt()?);
+            match self.parse_stmt() {
+                Ok(stmt) => stmts.push(stmt),
+                Err(e) => {
+                    errors.push(e);
+                    self.synchronize();
+                }
+            }
         }
-        Ok(stmts)
+        (stmts, errors)
+    }
+
+    /// After a parse error, skip tokens until we're past a '.' (the
+    /// statement terminator) or sitting right at what looks like the start
+    /// of the next statement, so parsing can resume from a sane point
+    /// instead of stopping outright.
+    fn synchronize(&mut self) {
+        loop {
+            match self.peek() {
+                Token::Eof => return,
+                Token::Period => {
+                    self.advance();
+                    return;
+                }
+                Token::Declare | Token::Print => return,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, QmclError> {

@@ -19,6 +19,20 @@ fn fail(err: QmclError, path: &str, source: &str) -> ! {
     exit(1);
 }
 
+/// Prints every error found in one pass, then exits — used whenever a stage
+/// can report more than one problem instead of stopping at the first.
+fn fail_all(errors: &[QmclError], path: &str, source: &str) -> ! {
+    for e in errors {
+        eprint!("{}", e.render(path, source));
+    }
+    eprintln!(
+        "{} error{} found.",
+        errors.len(),
+        if errors.len() == 1 { "" } else { "s" }
+    );
+    exit(1);
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let Some(path) = args.get(1) else {
@@ -35,14 +49,16 @@ fn main() {
         .tokenize()
         .unwrap_or_else(|e| fail(e, path, &source));
 
-    let program = parser::Parser::new(tokens)
-        .parse_program()
-        .unwrap_or_else(|e| fail(e, path, &source));
+    let (program, parse_errors) = parser::Parser::new(tokens).parse_program();
+    if !parse_errors.is_empty() {
+        fail_all(&parse_errors, path, &source);
+    }
 
     let context = Context::create();
     let mut codegen = codegen::Codegen::new(&context, "qmcl_module");
-    if let Err(e) = codegen.compile_program(&program) {
-        fail(e, path, &source);
+    let codegen_errors = codegen.compile_program(&program);
+    if !codegen_errors.is_empty() {
+        fail_all(&codegen_errors, path, &source);
     }
 
     let execution_engine = codegen
