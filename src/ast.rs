@@ -1,11 +1,14 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Type {
-    Number,
+    /// Bit width: 16, 32, or 64 (the default when no `:N` suffix is given,
+    /// e.g. `number:16` vs plain `number`).
+    Number(u8),
     String,
     Boolean,
     /// Stored normalized as a fraction (100% -> 1.0, 50% -> 0.5) so it's
     /// directly usable in arithmetic; printing re-multiplies by 100 and
-    /// re-appends '%' for display.
+    /// re-appends '%' for display. Always 64-bit — precision selection isn't
+    /// extended to percentage in this pass.
     Percentage,
 }
 

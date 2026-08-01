@@ -306,6 +306,16 @@ impl<'a> Lexer<'a> {
         if TYPE_NAMES.contains(&text.as_str()) {
             return Ok(Token::TypeName(text));
         }
+        // number:16 / number:32 / number:64 — a precision suffix on the
+        // number type. ':' and digits aren't reserved characters, so this
+        // already scans as a single identifier-like token above; the
+        // parser is what actually validates/parses the width and rejects
+        // anything else that happens to contain a colon.
+        if let Some(width) = text.strip_prefix("number:") {
+            if !width.is_empty() && width.chars().all(|c| c.is_ascii_digit()) {
+                return Ok(Token::TypeName(text));
+            }
+        }
         Ok(Token::Ident(text))
     }
 }

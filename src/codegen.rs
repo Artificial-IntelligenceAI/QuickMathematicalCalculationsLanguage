@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
+use inkwell::types::FloatType;
 use inkwell::values::{BasicMetadataValueEnum, FloatValue, FunctionValue, IntValue, PointerValue};
 use inkwell::{AddressSpace, FloatPredicate};
 
@@ -20,13 +21,14 @@ const LC_NUMERIC: i32 = 4;
 /// anymore, so callers (print formatting, arithmetic) need to know which
 /// kind they actually got.
 enum Value<'ctx> {
-    /// The bool is whether this value should print with thousands
-    /// separators (e.g. 1,000,000) — true if the literal it came from used
-    /// them, or if either side of an arithmetic operation did.
-    Number(FloatValue<'ctx>, bool),
-    /// Same underlying f64 as Number (already normalized to a fraction —
+    /// bool: whether this value should print with thousands separators
+    /// (e.g. 1,000,000) — true if the literal it came from used them, or
+    /// if either side of an arithmetic operation did.
+    /// u8: the actual bit width this value currently is (16/32/64).
+    Number(FloatValue<'ctx>, bool, u8),
+    /// Same underlying float as Number (already normalized to a fraction —
     /// 100% is stored as 1.0), kept as its own variant purely so printing
-    /// knows to re-scale by 100 and append '%'.
+    /// knows to re-scale by 100 and append '%'. Always 64-bit.
     Percentage(FloatValue<'ctx>, bool),
     Boolean(IntValue<'ctx>),
     Str(PointerValue<'ctx>),
@@ -42,10 +44,13 @@ pub struct Codegen<'ctx> {
     /// report every problem in the file, not just the first.
     errors: Vec<QmclError>,
     /// Notable-but-not-wrong things worth telling the programmer about,
-    /// e.g. a variable being shadowed. Never blocks compilation.
+    /// e.g. a variable being shadowed, or arithmetic silently promoting a
+    /// mismatched pair of number widths. Never blocks compilation.
     notes: Vec<QmclInfo>,
     /// libm's `pow` — LLVM has no native float-exponentiation instruction,
-    /// so `^`/`**` compiles to a call to this, same as C/C++ do.
+    /// so `^`/`**` compiles to a call to this, same as C/C++ do. Always
+    /// double-precision (that's libm's signature), regardless of operand
+    /// width.
     pow_fn: Option<FunctionValue<'ctx>>,
 }
 
@@ -64,6 +69,28 @@ impl<'ctx> Codegen<'ctx> {
 
     pub fn module(&self) -> &Module<'ctx> {
         &self.module
+    }
+
+    fn float_type_for_width(&self, width: u8) -> FloatType<'ctx> {
+        match width {
+            16 => self.context.f16_type(),
+            32 => self.context.f32_type(),
+            _ => self.context.f64_type(),
+        }
+    }
+
+    /// Widens or narrows `f` from `from_width` to `to_width`, or returns it
+    /// unchanged if they're already equal.
+    fn cast_to_width(&mut self, f: FloatValue<'ctx>, from_width: u8, to_width: u8) -> FloatValue<'ctx> {
+        if from_width == to_width {
+            return f;
+        }
+        let target_ty = self.float_type_for_width(to_width);
+        if to_width > from_width {
+            self.builder.build_float_ext(f, target_ty, "widen").unwrap()
+        } else {
+            self.builder.build_float_trunc(f, target_ty, "narrow").unwrap()
+        }
     }
 
     /// QMCL programs have no `fn main`-equivalent — top-level statements just
@@ -138,8 +165,17 @@ impl<'ctx> Codegen<'ctx> {
 
                 let val = self.compile_expr(value);
                 match ty {
-                    Type::Number | Type::Percentage => {
-                        let (f, grouped) = self.as_number(val, *name_span);
+                    Type::Number(width) => {
+                        let (f, grouped, val_width) = self.as_number(val, *name_span);
+                        let f = self.cast_to_width(f, val_width, *width);
+                        let float_ty = self.float_type_for_width(*width);
+                        let ptr = self.builder.build_alloca(float_ty, name).unwrap();
+                        self.builder.build_store(ptr, f).unwrap();
+                        self.vars.insert(name.clone(), (ptr, *ty, grouped));
+                    }
+                    Type::Percentage => {
+                        let (f, grouped, val_width) = self.as_number(val, *name_span);
+                        let f = self.cast_to_width(f, val_width, 64);
                         let f64_ty = self.context.f64_type();
                         let ptr = self.builder.build_alloca(f64_ty, name).unwrap();
                         self.builder.build_store(ptr, f).unwrap();
@@ -189,7 +225,12 @@ impl<'ctx> Codegen<'ctx> {
                 PrintPart::Value(expr) => {
                     let val = self.compile_expr(expr);
                     match val {
-                        Value::Number(f, grouped) => {
+                        Value::Number(f, grouped, width) => {
+                            // printf's variadic calling convention always
+                            // promotes float args to double — there's no
+                            // way to pass a raw 16/32-bit float to it, so
+                            // this widens regardless of the declared width.
+                            let f = self.cast_to_width(f, width, 64);
                             // %.15g: full double precision, but trims
                             // trailing zeros so a whole number like 1000.0
                             // prints as "1000" rather than "1000.000...".
@@ -245,8 +286,11 @@ impl<'ctx> Codegen<'ctx> {
     /// of the program looking for more problems.
     fn compile_expr(&mut self, expr: &Expr) -> Value<'ctx> {
         match expr {
+            // A bare literal has no inherent declared width; it's evaluated
+            // at 64-bit and narrowed later at the point of use (a narrower
+            // declare, or mixed-width arithmetic) if needed.
             Expr::NumberLiteral(n, grouped) => {
-                Value::Number(self.context.f64_type().const_float(*n), *grouped)
+                Value::Number(self.context.f64_type().const_float(*n), *grouped, 64)
             }
             Expr::StringLiteral(s) => {
                 let ptr = self
@@ -264,13 +308,14 @@ impl<'ctx> Codegen<'ctx> {
                     let ptr = *ptr;
                     let grouped = *grouped;
                     match ty {
-                        Type::Number => {
+                        Type::Number(width) => {
+                            let float_ty = self.float_type_for_width(*width);
                             let v = self
                                 .builder
-                                .build_load(self.context.f64_type(), ptr, name)
+                                .build_load(float_ty, ptr, name)
                                 .unwrap()
                                 .into_float_value();
-                            Value::Number(v, grouped)
+                            Value::Number(v, grouped, *width)
                         }
                         Type::Percentage => {
                             let v = self
@@ -308,35 +353,62 @@ impl<'ctx> Codegen<'ctx> {
                                 name
                             )),
                     );
-                    Value::Number(self.context.f64_type().const_float(0.0), false)
+                    Value::Number(self.context.f64_type().const_float(0.0), false, 64)
                 }
             },
             Expr::BinaryOp(op, left, right, op_span) => {
                 let l_val = self.compile_expr(left);
                 let r_val = self.compile_expr(right);
-                let (l, l_grouped) = self.as_number(l_val, *op_span);
-                let (r, r_grouped) = self.as_number(r_val, *op_span);
+                let (l, l_grouped, l_width) = self.as_number(l_val, *op_span);
+                let (r, r_grouped, r_width) = self.as_number(r_val, *op_span);
                 // If either side wants thousands separators, the result
                 // does too.
                 let grouped = l_grouped || r_grouped;
+                // Mixed precision auto-promotes to the wider side, but
+                // that's surfaced via the Informer rather than done
+                // silently.
+                let target_width = l_width.max(r_width);
+                if l_width != r_width {
+                    self.notes.push(
+                        QmclInfo::new(format!(
+                            "mixed precision here ({}-bit and {}-bit) — automatically computed at {}-bit",
+                            l_width, r_width, target_width
+                        ))
+                        .at(*op_span),
+                    );
+                }
+                let l = self.cast_to_width(l, l_width, target_width);
+                let r = self.cast_to_width(r, r_width, target_width);
                 match op {
-                    BinOp::Add => {
-                        Value::Number(self.builder.build_float_add(l, r, "addtmp").unwrap(), grouped)
-                    }
-                    BinOp::Sub => {
-                        Value::Number(self.builder.build_float_sub(l, r, "subtmp").unwrap(), grouped)
-                    }
-                    BinOp::Mul => {
-                        Value::Number(self.builder.build_float_mul(l, r, "multmp").unwrap(), grouped)
-                    }
-                    BinOp::Div => {
-                        Value::Number(self.builder.build_float_div(l, r, "divtmp").unwrap(), grouped)
-                    }
+                    BinOp::Add => Value::Number(
+                        self.builder.build_float_add(l, r, "addtmp").unwrap(),
+                        grouped,
+                        target_width,
+                    ),
+                    BinOp::Sub => Value::Number(
+                        self.builder.build_float_sub(l, r, "subtmp").unwrap(),
+                        grouped,
+                        target_width,
+                    ),
+                    BinOp::Mul => Value::Number(
+                        self.builder.build_float_mul(l, r, "multmp").unwrap(),
+                        grouped,
+                        target_width,
+                    ),
+                    BinOp::Div => Value::Number(
+                        self.builder.build_float_div(l, r, "divtmp").unwrap(),
+                        grouped,
+                        target_width,
+                    ),
                     BinOp::Pow => {
+                        // libm's pow is always (double, double) -> double,
+                        // regardless of the operands' actual width.
+                        let l64 = self.cast_to_width(l, target_width, 64);
+                        let r64 = self.cast_to_width(r, target_width, 64);
                         let pow_fn = self.pow_fn.expect("pow_fn set at start of compile_program");
                         let result = match self
                             .builder
-                            .build_call(pow_fn, &[l.into(), r.into()], "powtmp")
+                            .build_call(pow_fn, &[l64.into(), r64.into()], "powtmp")
                             .unwrap()
                             .try_as_basic_value()
                         {
@@ -345,7 +417,8 @@ impl<'ctx> Codegen<'ctx> {
                                 unreachable!("pow always returns a value, never void")
                             }
                         };
-                        Value::Number(result, grouped)
+                        let result = self.cast_to_width(result, 64, target_width);
+                        Value::Number(result, grouped, target_width)
                     }
                     // No boolean type is produced here (comparisons predate
                     // Boolean and still yield a plain number) — 1.0 or 0.0.
@@ -359,6 +432,7 @@ impl<'ctx> Codegen<'ctx> {
                                 .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
                                 .unwrap(),
                             false,
+                            64,
                         )
                     }
                     BinOp::Lt => {
@@ -371,6 +445,7 @@ impl<'ctx> Codegen<'ctx> {
                                 .build_unsigned_int_to_float(cmp, self.context.f64_type(), "booltmp")
                                 .unwrap(),
                             false,
+                            64,
                         )
                     }
                 }
@@ -378,13 +453,14 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Coerces a `Value` into a float (plus its "should print grouped"
-    /// flag) for arithmetic, reporting a clear error (rather than emitting
-    /// broken IR) if it's actually a string or boolean — those aren't
-    /// usable in arithmetic yet.
-    fn as_number(&mut self, v: Value<'ctx>, span: Span) -> (FloatValue<'ctx>, bool) {
+    /// Coerces a `Value` into a float (plus its "should print grouped" flag
+    /// and its current bit width) for arithmetic, reporting a clear error
+    /// (rather than emitting broken IR) if it's actually a string or
+    /// boolean — those aren't usable in arithmetic yet.
+    fn as_number(&mut self, v: Value<'ctx>, span: Span) -> (FloatValue<'ctx>, bool, u8) {
         match v {
-            Value::Number(f, grouped) | Value::Percentage(f, grouped) => (f, grouped),
+            Value::Number(f, grouped, width) => (f, grouped, width),
+            Value::Percentage(f, grouped) => (f, grouped, 64),
             Value::Boolean(_) => {
                 self.errors.push(
                     QmclError::new("a boolean value can't be used in arithmetic")
@@ -392,7 +468,7 @@ impl<'ctx> Codegen<'ctx> {
                         .rule("arithmetic operators only work on number/percentage values")
                         .suggest("only use +, -, *, /, ^ with number or percentage values"),
                 );
-                (self.context.f64_type().const_float(0.0), false)
+                (self.context.f64_type().const_float(0.0), false, 64)
             }
             Value::Str(_) => {
                 self.errors.push(
@@ -401,7 +477,7 @@ impl<'ctx> Codegen<'ctx> {
                         .rule("arithmetic operators only work on number/percentage values")
                         .suggest("only use +, -, *, /, ^ with number or percentage values"),
                 );
-                (self.context.f64_type().const_float(0.0), false)
+                (self.context.f64_type().const_float(0.0), false, 64)
             }
         }
     }

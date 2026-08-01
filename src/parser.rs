@@ -259,7 +259,22 @@ impl Parser {
 
         let ty_tok = self.advance();
         let ty = match ty_tok.node {
-            Token::TypeName(t) if t == "number" => Type::Number,
+            Token::TypeName(t) if t == "number" => Type::Number(64),
+            Token::TypeName(t) if t.starts_with("number:") => {
+                let width_str = &t["number:".len()..];
+                match width_str.parse::<u8>() {
+                    Ok(w @ (16 | 32 | 64)) => Type::Number(w),
+                    _ => {
+                        return Err(QmclError::new(format!(
+                            "unsupported number precision ':{}'",
+                            width_str
+                        ))
+                        .at(ty_tok.span)
+                        .rule("number's precision suffix must be 16, 32, or 64")
+                        .suggest("use number:16, number:32, number:64, or plain number (defaults to 64)"))
+                    }
+                }
+            }
             Token::TypeName(t) if t == "string" => Type::String,
             Token::TypeName(t) if t == "boolean" => Type::Boolean,
             Token::TypeName(t) if t == "percentage" => Type::Percentage,
@@ -270,7 +285,7 @@ impl Parser {
                 ))
                 .at(ty_tok.span)
                 .rule("a type name must follow the '=' in a declaration")
-                .suggest("use 'number', 'string', 'boolean', or 'percentage'"))
+                .suggest("use 'number' (optionally number:16/32/64), 'string', 'boolean', or 'percentage'"))
             }
         };
 
@@ -278,7 +293,7 @@ impl Parser {
         // variable references) right now — string/boolean/percentage take a
         // single literal value each, parsed according to their own rules.
         let value = match ty {
-            Type::Number => self.parse_expr()?,
+            Type::Number(_) => self.parse_expr()?,
             Type::String => {
                 let tok = self.advance();
                 match tok.node {
