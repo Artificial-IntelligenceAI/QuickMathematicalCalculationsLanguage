@@ -19,6 +19,11 @@ pub enum Token {
     LBracket,
     RBracket,
     Equals,
+    Plus,
+    Minus,
+    Star,
+    /// `/` or `÷` — both produce this same token, `÷` is just an alias.
+    Slash,
     /// Statement terminator `.`. Only ever produced outside a quoted span —
     /// numeric literals are always written quoted (e.g. `'1000'`), so a bare
     /// `.` at the top level is unambiguously a terminator, not a decimal point.
@@ -40,6 +45,10 @@ pub fn describe(tok: &Token) -> String {
         Token::LBracket => "'['".to_string(),
         Token::RBracket => "']'".to_string(),
         Token::Equals => "'='".to_string(),
+        Token::Plus => "'+'".to_string(),
+        Token::Minus => "'-'".to_string(),
+        Token::Star => "'*'".to_string(),
+        Token::Slash => "'/'".to_string(),
         Token::Period => "'.'".to_string(),
         Token::Eof => "end of file".to_string(),
     }
@@ -47,7 +56,10 @@ pub fn describe(tok: &Token) -> String {
 
 /// Characters that can never be part of a bare identifier or emoji name.
 fn is_reserved(g: &str) -> bool {
-    matches!(g, "'" | "\"" | "(" | ")" | "[" | "]" | "=" | "." | "\\")
+    matches!(
+        g,
+        "'" | "\"" | "(" | ")" | "[" | "]" | "=" | "." | "\\" | "+" | "-" | "*" | "/" | "÷"
+    )
 }
 
 fn is_ascii_digit(g: &str) -> bool {
@@ -165,6 +177,22 @@ impl<'a> Lexer<'a> {
                 Some("=") => {
                     self.advance();
                     tokens.push(Spanned::new(Token::Equals, start));
+                }
+                Some("+") => {
+                    self.advance();
+                    tokens.push(Spanned::new(Token::Plus, start));
+                }
+                Some("-") => {
+                    self.advance();
+                    tokens.push(Spanned::new(Token::Minus, start));
+                }
+                Some("*") => {
+                    self.advance();
+                    tokens.push(Spanned::new(Token::Star, start));
+                }
+                Some("/") | Some("÷") => {
+                    self.advance();
+                    tokens.push(Spanned::new(Token::Slash, start));
                 }
                 Some(".") => {
                     self.advance();

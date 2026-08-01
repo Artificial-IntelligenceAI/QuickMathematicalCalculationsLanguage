@@ -111,6 +111,81 @@ impl Parser {
         }
     }
 
+    /// expr := term (('+' | '-') term)*  — left-associative, lowest precedence.
+    fn parse_expr(&mut self) -> Result<Expr, QmclError> {
+        let mut left = self.parse_term()?;
+        loop {
+            let op = match self.peek() {
+                Token::Plus => BinOp::Add,
+                Token::Minus => BinOp::Sub,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_term()?;
+            left = Expr::BinaryOp(op, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    /// term := atom (('*' | '/') atom)*  — binds tighter than +/-.
+    fn parse_term(&mut self) -> Result<Expr, QmclError> {
+        let mut left = self.parse_atom()?;
+        loop {
+            let op = match self.peek() {
+                Token::Star => BinOp::Mul,
+                Token::Slash => BinOp::Div,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_atom()?;
+            left = Expr::BinaryOp(op, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    /// atom := a quoted number literal, or a (variable) reference.
+    fn parse_atom(&mut self) -> Result<Expr, QmclError> {
+        let tok = self.advance();
+        match tok.node {
+            Token::Quoted(s) => {
+                let n: f64 = s.parse().map_err(|_| {
+                    QmclError::new(format!("'{}' is not a valid number literal", s))
+                        .at(tok.span)
+                        .rule("a quoted number literal must be a valid number")
+                        .suggest("use digits, optionally with a decimal point, e.g. '1000' or '3.14'")
+                })?;
+                Ok(Expr::NumberLiteral(n))
+            }
+            Token::LParen => {
+                let ident_tok = self.advance();
+                let (name, span) = match ident_tok.node {
+                    Token::Ident(n) => (n, ident_tok.span),
+                    other => {
+                        return Err(QmclError::new(format!(
+                            "expected an identifier inside (), found {}",
+                            describe(&other)
+                        ))
+                        .at(ident_tok.span)
+                        .rule("inside ( ), only a bare (unquoted) variable name is allowed")
+                        .suggest("reference a variable like (x), with no quotes around it"))
+                    }
+                };
+                self.expect(&Token::RParen).map_err(|e| {
+                    e.rule("a '(' opened to reference a variable must be closed with ')'")
+                        .suggest("add a ')' right after the variable name")
+                })?;
+                Ok(Expr::Var(name, span))
+            }
+            other => Err(QmclError::new(format!(
+                "expected a number or (variable), found {}",
+                describe(&other)
+            ))
+            .at(tok.span)
+            .rule("expressions are built from quoted numbers and (variable) references")
+            .suggest("write a number like '5' or a variable reference like (x)")),
+        }
+    }
+
     fn parse_declare(&mut self) -> Result<Stmt, QmclError> {
         self.advance(); // `declare`
 
@@ -148,27 +223,7 @@ impl Parser {
             }
         };
 
-        let value_tok = self.advance();
-        let value = match value_tok.node {
-            Token::Quoted(s) => {
-                let n: f64 = s.parse().map_err(|_| {
-                    QmclError::new(format!("'{}' is not a valid number literal", s))
-                        .at(value_tok.span)
-                        .rule("a quoted number literal must be a valid number")
-                        .suggest("use digits, optionally with a decimal point, e.g. '1000' or '3.14'")
-                })?;
-                Expr::NumberLiteral(n)
-            }
-            other => {
-                return Err(QmclError::new(format!(
-                    "expected a quoted literal value, found {}",
-                    describe(&other)
-                ))
-                .at(value_tok.span)
-                .rule("a declared value must be written in quotes, right after its type")
-                .suggest("write the value in quotes, e.g. number '1000'"))
-            }
-        };
+        let value = self.parse_expr()?;
 
         self.expect(&Token::Period).map_err(|e| {
             e.rule("every statement must end with a '.'")
@@ -194,26 +249,9 @@ impl Parser {
                     self.advance();
                     parts.push(PrintPart::Text(s));
                 }
-                Token::LParen => {
-                    self.advance();
-                    let ident_tok = self.advance();
-                    let (name, span) = match ident_tok.node {
-                        Token::Ident(n) => (n, ident_tok.span),
-                        other => {
-                            return Err(QmclError::new(format!(
-                                "expected an identifier inside (), found {}",
-                                describe(&other)
-                            ))
-                            .at(ident_tok.span)
-                            .rule("inside ( ), only a bare (unquoted) variable name is allowed")
-                            .suggest("reference a variable like (x), with no quotes around it"))
-                        }
-                    };
-                    self.expect(&Token::RParen).map_err(|e| {
-                        e.rule("a '(' opened to reference a variable must be closed with ')'")
-                            .suggest("add a ')' right after the variable name")
-                    })?;
-                    parts.push(PrintPart::Value(Expr::Var(name, span)));
+                Token::LParen | Token::Quoted(_) => {
+                    let expr = self.parse_expr()?;
+                    parts.push(PrintPart::Value(expr));
                 }
                 Token::Eof => {
                     return Err(QmclError::new("unclosed 'print[...]' — reached end of file")
@@ -227,8 +265,8 @@ impl Parser {
                         describe(&other)
                     ))
                     .at(self.error_span())
-                    .rule("print[...] only accepts \"text\" and (variable) references")
-                    .suggest("wrap text in \"...\" or reference a variable with (...)"))
+                    .rule("each part of print[...] must start with \"text\", a number, or a (variable) reference")
+                    .suggest("wrap text in \"...\" or start an expression with a number or (variable)"))
                 }
             }
         }

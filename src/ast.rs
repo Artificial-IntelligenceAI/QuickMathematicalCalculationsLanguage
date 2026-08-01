@@ -6,12 +6,21 @@ pub enum Type {
 use crate::error::Span;
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     NumberLiteral(f64),
     /// A variable reference (the `x` in `(x)`), carrying where it was
     /// written so codegen can point at it if the variable turns out to be
     /// undeclared.
     Var(String, Span),
+    BinaryOp(BinOp, Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

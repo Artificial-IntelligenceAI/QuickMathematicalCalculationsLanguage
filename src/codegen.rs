@@ -149,6 +149,16 @@ impl<'ctx> Codegen<'ctx> {
                     self.context.f64_type().const_float(0.0)
                 }
             },
+            Expr::BinaryOp(op, left, right) => {
+                let l = self.compile_expr(left);
+                let r = self.compile_expr(right);
+                match op {
+                    BinOp::Add => self.builder.build_float_add(l, r, "addtmp").unwrap(),
+                    BinOp::Sub => self.builder.build_float_sub(l, r, "subtmp").unwrap(),
+                    BinOp::Mul => self.builder.build_float_mul(l, r, "multmp").unwrap(),
+                    BinOp::Div => self.builder.build_float_div(l, r, "divtmp").unwrap(),
+                }
+            }
         }
     }
 }
