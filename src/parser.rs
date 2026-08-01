@@ -214,6 +214,12 @@ impl Parser {
                     })?;
                     parts.push(PrintPart::Value(Expr::Var(name, span)));
                 }
+                Token::Eof => {
+                    return Err(QmclError::new("unclosed 'print[...]' — reached end of file")
+                        .at(self.error_span())
+                        .rule("every 'print[' must be closed with a matching ']'")
+                        .suggest("add a ']' to close this print[...] call"))
+                }
                 other => {
                     return Err(QmclError::new(format!(
                         "unexpected {} inside print[...]",

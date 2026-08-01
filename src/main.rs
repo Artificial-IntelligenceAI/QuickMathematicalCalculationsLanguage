@@ -44,6 +44,13 @@ fn main() {
         eprintln!("qmcl: couldn't read '{}': {}", path, e);
         exit(1);
     });
+    // Some editors (notably on Windows) save UTF-8 files with a leading
+    // byte-order-mark. It's invisible but isn't whitespace, so left in
+    // place it would glue itself onto the very first token and corrupt it.
+    // Stripped once here (rather than inside the lexer) so every downstream
+    // consumer, including error rendering, sees identical text — otherwise
+    // column numbers would drift by one from what render() displays.
+    let source = source.strip_prefix('\u{FEFF}').unwrap_or(&source).to_string();
 
     let tokens = lexer::Lexer::new(&source)
         .tokenize()
