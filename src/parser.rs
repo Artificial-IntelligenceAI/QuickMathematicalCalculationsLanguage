@@ -85,15 +85,16 @@ impl Parser {
         (stmts, errors)
     }
 
-    /// After a parse error, skip tokens until we're past a '.' (the
-    /// statement terminator) or sitting right at what looks like the start
-    /// of the next statement, so parsing can resume from a sane point
-    /// instead of stopping outright.
+    /// After a parse error, skip tokens until we're past a '.' or a '}'
+    /// (both can terminate a statement — a block's closing '}' needs no
+    /// trailing '.') or sitting right at what looks like the start of the
+    /// next statement, so parsing can resume from a sane point instead of
+    /// stopping outright.
     fn synchronize(&mut self) {
         loop {
             match self.peek() {
                 Token::Eof => return,
-                Token::Period => {
+                Token::Period | Token::RBrace => {
                     self.advance();
                     return;
                 }
@@ -447,10 +448,12 @@ impl Parser {
         Ok(Stmt::Print { parts })
     }
 
-    /// repeat '<name>' from <expr> to <expr> [ <statements> ].
+    /// repeat '<name>' from <expr> to <expr> { <statements> }
     /// Inclusive range, step +1. `from`/`to` are parsed with
     /// `prefer_integer = true` since the loop variable is always an
     /// integer — codegen enforces that they actually resolve to one.
+    /// The body's closing '}' terminates the whole statement on its own —
+    /// no trailing '.', same convention as a C/Rust/Java `{}` block.
     fn parse_counted_loop(&mut self) -> Result<Stmt, QmclError> {
         self.advance(); // `repeat`
 
@@ -465,45 +468,41 @@ impl Parser {
                 ))
                 .at(name_tok.span)
                 .rule("the loop variable's name must be written in quotes right after 'repeat'")
-                .suggest("write the name in quotes, e.g. repeat 'i' from '1' to '10' [ ... ]."))
+                .suggest("write the name in quotes, e.g. repeat 'i' from '1' to '10' { ... }"))
             }
         };
 
         self.expect(&Token::From).map_err(|e| {
             e.rule("'repeat' is followed by 'from' and the loop's starting value")
-                .suggest("add 'from', e.g. repeat 'i' from '1' to '10' [ ... ].")
+                .suggest("add 'from', e.g. repeat 'i' from '1' to '10' { ... }")
         })?;
         let start = self.parse_expr(true)?;
 
         self.expect(&Token::To).map_err(|e| {
             e.rule("the starting value is followed by 'to' and the loop's ending value")
-                .suggest("add 'to', e.g. repeat 'i' from '1' to '10' [ ... ].")
+                .suggest("add 'to', e.g. repeat 'i' from '1' to '10' { ... }")
         })?;
         let end = self.parse_expr(true)?;
 
-        self.expect(&Token::LBracket).map_err(|e| {
-            e.rule("a loop's body goes inside [ ], right after its 'to' bound")
-                .suggest("add [ ] for the loop body, e.g. repeat 'i' from '1' to '10' [ print[(i)]. ].")
+        self.expect(&Token::LBrace).map_err(|e| {
+            e.rule("a loop's body goes inside { }, right after its 'to' bound")
+                .suggest("add { } for the loop body, e.g. repeat 'i' from '1' to '10' { print[(i)]. }")
         })?;
 
         let mut body = Vec::new();
-        while *self.peek() != Token::RBracket {
+        while *self.peek() != Token::RBrace {
             if *self.peek() == Token::Eof {
                 return Err(QmclError::new("unclosed loop body — reached end of file")
                     .at(self.error_span())
-                    .rule("a loop body opened with '[' must be closed with a matching ']'")
-                    .suggest("add a ']' to close this loop's body"));
+                    .rule("a loop body opened with '{' must be closed with a matching '}'")
+                    .suggest("add a '}' to close this loop's body"));
             }
             body.push(self.parse_stmt()?);
         }
 
-        self.expect(&Token::RBracket).map_err(|e| {
-            e.rule("a loop's body must be closed with a matching ']'")
-                .suggest("add a ']' to close the loop body")
-        })?;
-        self.expect(&Token::Period).map_err(|e| {
-            e.rule("every statement must end with a '.'")
-                .suggest("add a '.' at the end")
+        self.expect(&Token::RBrace).map_err(|e| {
+            e.rule("a loop's body must be closed with a matching '}'")
+                .suggest("add a '}' to close the loop body")
         })?;
 
         Ok(Stmt::CountedLoop { var_name, var_name_span, start, end, body })

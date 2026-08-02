@@ -21,6 +21,14 @@ pub enum Token {
     RParen,
     LBracket,
     RBracket,
+    /// `{` — opens a statement block (e.g. a loop body). Distinct from `[]`,
+    /// which is the argument-list delimiter (print's args, not full
+    /// statements).
+    LBrace,
+    /// `}` — closes a statement block. Also terminates whatever statement
+    /// it belongs to (a loop, etc.) on its own — no trailing `.` needed,
+    /// same convention as C/Rust/Java's `{}` blocks.
+    RBrace,
     Equals,
     Plus,
     Minus,
@@ -54,6 +62,8 @@ pub fn describe(tok: &Token) -> String {
         Token::RParen => "')'".to_string(),
         Token::LBracket => "'['".to_string(),
         Token::RBracket => "']'".to_string(),
+        Token::LBrace => "'{'".to_string(),
+        Token::RBrace => "'}'".to_string(),
         Token::Equals => "'='".to_string(),
         Token::Plus => "'+'".to_string(),
         Token::Minus => "'-'".to_string(),
@@ -71,8 +81,8 @@ pub fn describe(tok: &Token) -> String {
 fn is_reserved(g: &str) -> bool {
     matches!(
         g,
-        "'" | "\"" | "(" | ")" | "[" | "]" | "=" | "." | "\\" | "+" | "-" | "*" | "/" | "÷" | "^"
-            | ">" | "<"
+        "'" | "\"" | "(" | ")" | "[" | "]" | "{" | "}" | "=" | "." | "\\" | "+" | "-" | "*" | "/"
+            | "÷" | "^" | ">" | "<"
     )
 }
 
@@ -190,6 +200,14 @@ impl<'a> Lexer<'a> {
                 Some("]") => {
                     self.advance();
                     tokens.push(Spanned::new(Token::RBracket, start));
+                }
+                Some("{") => {
+                    self.advance();
+                    tokens.push(Spanned::new(Token::LBrace, start));
+                }
+                Some("}") => {
+                    self.advance();
+                    tokens.push(Spanned::new(Token::RBrace, start));
                 }
                 Some("=") => {
                     self.advance();

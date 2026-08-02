@@ -71,8 +71,9 @@ pub enum Stmt {
     Print {
         parts: Vec<PrintPart>,
     },
-    /// `repeat 'i' from <start> to <end> [ body ].` — inclusive range,
-    /// step +1. The loop variable is always a 64-bit integer. No lexical
+    /// `repeat 'i' from <start> to <end> { body }` — inclusive range,
+    /// step +1. The closing '}' ends the statement on its own, no trailing
+    /// '.'. The loop variable is always a 64-bit integer. No lexical
     /// scoping exists yet, so it (and anything declared in the body)
     /// remains accessible after the loop ends, holding its final value.
     CountedLoop {
