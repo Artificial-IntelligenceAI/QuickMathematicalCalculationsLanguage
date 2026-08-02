@@ -6,6 +6,9 @@ use crate::error::{QmclError, Span, Spanned};
 pub enum Token {
     Declare,
     Print,
+    Repeat,
+    From,
+    To,
     TypeName(String),
     /// Content of a `'...'` span: a declared name or a literal value.
     /// Which one it is depends on where the parser encounters it.
@@ -40,6 +43,9 @@ pub fn describe(tok: &Token) -> String {
     match tok {
         Token::Declare => "'declare'".to_string(),
         Token::Print => "'print'".to_string(),
+        Token::Repeat => "'repeat'".to_string(),
+        Token::From => "'from'".to_string(),
+        Token::To => "'to'".to_string(),
         Token::TypeName(t) => format!("type name '{}'", t),
         Token::Quoted(s) => format!("'{}'", s),
         Token::Str(s) => format!("\"{}\"", s),
@@ -108,6 +114,9 @@ pub struct Lexer<'a> {
 const KEYWORDS: &[(&str, fn() -> Token)] = &[
     ("declare", || Token::Declare),
     ("print", || Token::Print),
+    ("repeat", || Token::Repeat),
+    ("from", || Token::From),
+    ("to", || Token::To),
 ];
 
 const TYPE_NAMES: &[&str] = &["number", "string", "boolean", "percentage", "integer"];

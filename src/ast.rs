@@ -71,6 +71,18 @@ pub enum Stmt {
     Print {
         parts: Vec<PrintPart>,
     },
+    /// `repeat 'i' from <start> to <end> [ body ].` — inclusive range,
+    /// step +1. The loop variable is always a 64-bit integer. No lexical
+    /// scoping exists yet, so it (and anything declared in the body)
+    /// remains accessible after the loop ends, holding its final value.
+    CountedLoop {
+        var_name: String,
+        /// Where the loop variable's name was written, for error spans.
+        var_name_span: Span,
+        start: Expr,
+        end: Expr,
+        body: Vec<Stmt>,
+    },
 }
 
 pub type Program = Vec<Stmt>;

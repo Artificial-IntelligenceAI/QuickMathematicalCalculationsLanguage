@@ -64,6 +64,11 @@ pub struct Codegen<'ctx> {
     /// double-precision (that's libm's signature), regardless of operand
     /// width.
     pow_fn: Option<FunctionValue<'ctx>>,
+    printf_fn: Option<FunctionValue<'ctx>>,
+    /// QMCL has no user-defined functions yet — everything compiles into
+    /// this one `main`, which loops need a handle to in order to append
+    /// new basic blocks (for the condition/body/end of the loop).
+    main_fn: Option<FunctionValue<'ctx>>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -76,6 +81,8 @@ impl<'ctx> Codegen<'ctx> {
             errors: Vec::new(),
             notes: Vec::new(),
             pow_fn: None,
+            printf_fn: None,
+            main_fn: None,
         }
     }
 
@@ -205,6 +212,25 @@ impl<'ctx> Codegen<'ctx> {
         self.vars.insert(name.to_string(), (ptr, ty, false));
     }
 
+    /// Requires a Value to be a genuine integer (widened/narrowed to
+    /// 64-bit), reporting a clear error — rather than emitting broken IR —
+    /// if it turns out to be a float/percentage/boolean/string. Used for a
+    /// loop's `from`/`to` bounds, which must be true integers.
+    fn require_integer(&mut self, v: Value<'ctx>, span: Span, what: &str) -> IntValue<'ctx> {
+        match self.classify_numeric(v, span) {
+            Numeric::Int(i, _grouped, width) => self.cast_int_to_width(i, width, 64),
+            Numeric::Float(..) => {
+                self.errors.push(
+                    QmclError::new(format!("{} must be an integer", what))
+                        .at(span)
+                        .rule("a loop's 'from'/'to' bounds must be genuine integers, not a number/percentage")
+                        .suggest("use an integer literal or an integer-typed variable for the loop bounds"),
+                );
+                self.context.i64_type().const_int(0, false)
+            }
+        }
+    }
+
     /// QMCL programs have no `fn main`-equivalent — top-level statements just
     /// run in order. This emits them straight into a single LLVM `main`
     /// function, which is compiler plumbing the programmer never writes.
@@ -220,6 +246,7 @@ impl<'ctx> Codegen<'ctx> {
         let i32_ty = self.context.i32_type();
         let printf_ty = i32_ty.fn_type(&[i8_ptr_ty.into()], true);
         let printf_fn = self.module.add_function("printf", printf_ty, None);
+        self.printf_fn = Some(printf_fn);
 
         let f64_ty = self.context.f64_type();
         let pow_ty = f64_ty.fn_type(&[f64_ty.into(), f64_ty.into()], false);
@@ -230,6 +257,7 @@ impl<'ctx> Codegen<'ctx> {
 
         let main_ty = i32_ty.fn_type(&[], false);
         let main_fn = self.module.add_function("main", main_ty, None);
+        self.main_fn = Some(main_fn);
         let entry = self.context.append_basic_block(main_fn, "entry");
         self.builder.position_at_end(entry);
 
@@ -252,7 +280,7 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap();
 
         for stmt in program {
-            self.compile_stmt(stmt, printf_fn);
+            self.compile_stmt(stmt);
         }
 
         self.builder
@@ -262,7 +290,7 @@ impl<'ctx> Codegen<'ctx> {
         (std::mem::take(&mut self.errors), std::mem::take(&mut self.notes))
     }
 
-    fn compile_stmt(&mut self, stmt: &Stmt, printf_fn: FunctionValue<'ctx>) {
+    fn compile_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Declare { name, name_span, ty, value } => {
                 if self.vars.contains_key(name) {
@@ -346,11 +374,15 @@ impl<'ctx> Codegen<'ctx> {
                     }
                 }
             }
-            Stmt::Print { parts } => self.compile_print(parts, printf_fn),
+            Stmt::Print { parts } => self.compile_print(parts),
+            Stmt::CountedLoop { var_name, var_name_span, start, end, body } => {
+                self.compile_counted_loop(var_name, *var_name_span, start, end, body)
+            }
         }
     }
 
-    fn compile_print(&mut self, parts: &[PrintPart], printf_fn: FunctionValue<'ctx>) {
+    fn compile_print(&mut self, parts: &[PrintPart]) {
+        let printf_fn = self.printf_fn.expect("printf_fn set at start of compile_program");
         let mut fmt = String::new();
         let mut args: Vec<BasicMetadataValueEnum> = Vec::new();
 
@@ -726,5 +758,68 @@ impl<'ctx> Codegen<'ctx> {
                 )
             }
         }
+    }
+
+    /// `repeat 'i' from <start> to <end> [ body ].` — inclusive range,
+    /// step +1, loop variable always a 64-bit integer. The first (and so
+    /// far only) construct that needs real branching: LLVM basic blocks
+    /// for the condition check, the body, and where control resumes after
+    /// the loop ends.
+    ///
+    /// No lexical scoping exists yet, so `var_name` (and anything the body
+    /// declares) is registered in the same flat `self.vars` table as
+    /// everything else, and remains accessible — holding its final value —
+    /// after the loop finishes.
+    fn compile_counted_loop(
+        &mut self,
+        var_name: &str,
+        var_name_span: Span,
+        start: &Expr,
+        end: &Expr,
+        body: &[Stmt],
+    ) {
+        let main_fn = self.main_fn.expect("main_fn set at start of compile_program");
+        let i64_ty = self.context.i64_type();
+
+        let start_val = self.compile_expr(start);
+        let start_i = self.require_integer(start_val, var_name_span, "a loop's 'from' bound");
+        let end_val = self.compile_expr(end);
+        let end_i = self.require_integer(end_val, var_name_span, "a loop's 'to' bound");
+
+        // The loop variable is a plain 64-bit integer, stored like any
+        // other declared variable — registering it here is what makes
+        // (i) usable inside the body.
+        let ptr = self.builder.build_alloca(i64_ty, var_name).unwrap();
+        self.builder.build_store(ptr, start_i).unwrap();
+        self.vars.insert(var_name.to_string(), (ptr, Type::Integer(64), false));
+
+        let cond_bb = self.context.append_basic_block(main_fn, "loop_cond");
+        let body_bb = self.context.append_basic_block(main_fn, "loop_body");
+        let end_bb = self.context.append_basic_block(main_fn, "loop_end");
+
+        self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+        // loop_cond: while current <= end, keep going.
+        self.builder.position_at_end(cond_bb);
+        let current = self.builder.build_load(i64_ty, ptr, var_name).unwrap().into_int_value();
+        let keep_going = self
+            .builder
+            .build_int_compare(IntPredicate::SLE, current, end_i, "loopcond")
+            .unwrap();
+        self.builder.build_conditional_branch(keep_going, body_bb, end_bb).unwrap();
+
+        // loop_body: run the body, then increment and jump back to the check.
+        self.builder.position_at_end(body_bb);
+        for stmt in body {
+            self.compile_stmt(stmt);
+        }
+        let current = self.builder.build_load(i64_ty, ptr, var_name).unwrap().into_int_value();
+        let one = i64_ty.const_int(1, false);
+        let next = self.builder.build_int_add(current, one, "loopinc").unwrap();
+        self.builder.build_store(ptr, next).unwrap();
+        self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+        // Everything after the loop statement continues here.
+        self.builder.position_at_end(end_bb);
     }
 }

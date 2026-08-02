@@ -97,7 +97,7 @@ impl Parser {
                     self.advance();
                     return;
                 }
-                Token::Declare | Token::Print => return,
+                Token::Declare | Token::Print | Token::Repeat => return,
                 _ => {
                     self.advance();
                 }
@@ -109,13 +109,14 @@ impl Parser {
         match self.peek() {
             Token::Declare => self.parse_declare(),
             Token::Print => self.parse_print(),
+            Token::Repeat => self.parse_counted_loop(),
             other => Err(QmclError::new(format!(
                 "expected a statement, found {}",
                 describe(other)
             ))
             .at(self.error_span())
-            .rule("every statement must start with 'declare' or 'print'")
-            .suggest("start this statement with 'declare' or 'print'")),
+            .rule("every statement must start with 'declare', 'print', or 'repeat'")
+            .suggest("start this statement with 'declare', 'print', or 'repeat'")),
         }
     }
 
@@ -444,5 +445,67 @@ impl Parser {
         })?;
 
         Ok(Stmt::Print { parts })
+    }
+
+    /// repeat '<name>' from <expr> to <expr> [ <statements> ].
+    /// Inclusive range, step +1. `from`/`to` are parsed with
+    /// `prefer_integer = true` since the loop variable is always an
+    /// integer — codegen enforces that they actually resolve to one.
+    fn parse_counted_loop(&mut self) -> Result<Stmt, QmclError> {
+        self.advance(); // `repeat`
+
+        let name_tok = self.advance();
+        let var_name_span = name_tok.span;
+        let var_name = match name_tok.node {
+            Token::Quoted(s) => s,
+            other => {
+                return Err(QmclError::new(format!(
+                    "expected a quoted loop variable name after 'repeat', found {}",
+                    describe(&other)
+                ))
+                .at(name_tok.span)
+                .rule("the loop variable's name must be written in quotes right after 'repeat'")
+                .suggest("write the name in quotes, e.g. repeat 'i' from '1' to '10' [ ... ]."))
+            }
+        };
+
+        self.expect(&Token::From).map_err(|e| {
+            e.rule("'repeat' is followed by 'from' and the loop's starting value")
+                .suggest("add 'from', e.g. repeat 'i' from '1' to '10' [ ... ].")
+        })?;
+        let start = self.parse_expr(true)?;
+
+        self.expect(&Token::To).map_err(|e| {
+            e.rule("the starting value is followed by 'to' and the loop's ending value")
+                .suggest("add 'to', e.g. repeat 'i' from '1' to '10' [ ... ].")
+        })?;
+        let end = self.parse_expr(true)?;
+
+        self.expect(&Token::LBracket).map_err(|e| {
+            e.rule("a loop's body goes inside [ ], right after its 'to' bound")
+                .suggest("add [ ] for the loop body, e.g. repeat 'i' from '1' to '10' [ print[(i)]. ].")
+        })?;
+
+        let mut body = Vec::new();
+        while *self.peek() != Token::RBracket {
+            if *self.peek() == Token::Eof {
+                return Err(QmclError::new("unclosed loop body — reached end of file")
+                    .at(self.error_span())
+                    .rule("a loop body opened with '[' must be closed with a matching ']'")
+                    .suggest("add a ']' to close this loop's body"));
+            }
+            body.push(self.parse_stmt()?);
+        }
+
+        self.expect(&Token::RBracket).map_err(|e| {
+            e.rule("a loop's body must be closed with a matching ']'")
+                .suggest("add a ']' to close the loop body")
+        })?;
+        self.expect(&Token::Period).map_err(|e| {
+            e.rule("every statement must end with a '.'")
+                .suggest("add a '.' at the end")
+        })?;
+
+        Ok(Stmt::CountedLoop { var_name, var_name_span, start, end, body })
     }
 }
