@@ -82,7 +82,7 @@ fn is_reserved(g: &str) -> bool {
     matches!(
         g,
         "'" | "\"" | "(" | ")" | "[" | "]" | "{" | "}" | "=" | "." | "\\" | "+" | "-" | "*" | "/"
-            | "÷" | "^" | ">" | "<"
+            | "÷" | "^" | ">" | "<" | "#"
     )
 }
 
@@ -173,10 +173,80 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Consumes the rest of the current line (up to but not including the
+    /// terminating '\n', or up to EOF).
+    fn skip_to_end_of_line(&mut self) {
+        while let Some(g) = self.peek() {
+            if g == "\n" {
+                break;
+            }
+            self.advance();
+        }
+    }
+
+    /// Consumes one whole line below the current position: the '\n' that
+    /// ends the previous line (if any), then that next line's content up to
+    /// its own terminating '\n'/EOF.
+    fn skip_full_line_below(&mut self) {
+        if self.peek() == Some("\n") {
+            self.advance();
+        }
+        self.skip_to_end_of_line();
+    }
+
+    /// Consumes a `#` comment, in one of three forms (`#` must be at `pos`):
+    /// - `#` alone: comments the rest of this line only.
+    /// - `#N`: comments this line plus the next N-1 lines below it — N is
+    ///   the *total* number of lines commented, including this one.
+    /// - `#Nd` ('d' for "down"): comments this line plus the next N lines
+    ///   below it — N here counts only the lines *below*, not this one, so
+    ///   the total is N+1.
+    fn skip_comment(&mut self) {
+        self.advance(); // consume '#'
+
+        let mut digits = String::new();
+        while let Some(g) = self.peek() {
+            if g.chars().count() == 1 && g.chars().next().unwrap().is_ascii_digit() {
+                digits.push_str(g);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        if digits.is_empty() {
+            self.skip_to_end_of_line();
+            return;
+        }
+
+        let down = self.peek() == Some("d");
+        if down {
+            self.advance();
+        }
+
+        let n: u64 = digits.parse().unwrap_or(u64::MAX);
+        let extra_lines_below = if down { n } else { n.saturating_sub(1) };
+
+        self.skip_to_end_of_line();
+        for _ in 0..extra_lines_below {
+            if self.peek().is_none() {
+                break;
+            }
+            self.skip_full_line_below();
+        }
+    }
+
     pub fn tokenize(mut self) -> Result<Vec<Spanned<Token>>, QmclError> {
         let mut tokens = Vec::new();
         loop {
-            self.skip_whitespace();
+            loop {
+                self.skip_whitespace();
+                if self.peek() == Some("#") {
+                    self.skip_comment();
+                } else {
+                    break;
+                }
+            }
             let start = self.current_span();
             match self.peek() {
                 None => {
